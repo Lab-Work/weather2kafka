@@ -1,35 +1,74 @@
-import threading
-import traceback
-import json
-import time
-import os
-import sys
+"""weather2kafka — NWS forecast/current conditions and NOAA MRMS radar to Kafka + Postgres.
+
+Two independent feeds run on their own threads with their own cadences:
+    * weather_forecast — api.weather.gov points/stations/hourly forecast
+    * weather_radar    — MRMS BREF_QCD GeoTIFF, clipped to a lat/lon radius
+
+    Run:        python weather2kafka.py
+    Logs:       JSON on stdout (Loki-friendly)
+    Metrics:    /metrics endpoint on :9100 (Prometheus)
+"""
+
+from __future__ import annotations
+
 import datetime as dt
+import gzip
+import json
+import os
+import shutil
+import signal
+import sys
+import threading
+import time
+import traceback
+from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
-import requests
-import gzip
-import shutil
-import rasterio
-from rasterio.transform import xy
-from pyproj import Transformer
 import matplotlib.pyplot as plt
-from datetime import datetime
-from bs4 import BeautifulSoup
 import numpy as np
-from pyproj import CRS
-from pyproj import Transformer
-
-import kafka_confluent as kc
-import psycopg as pg
-
-import logging
-logger = logging.getLogger(__name__)
-logging.getLogger('matplotlib.font_manager').disabled = True
+import rasterio
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from pyproj import CRS, Transformer
+from rasterio.transform import xy
+
+from lv_db_connector import Connector, DbEnvCredentials
+from lv_kafka_connector import KafkaEnvCredentials, KafkaProducer
+from lv_telemetry_connector import configure_telemetry
+
 load_dotenv()
 
+SERVICE = os.getenv("SERVICE_NAME", "weather2kafka")
+
 nashville_tz = ZoneInfo('US/Central')
+
+# Telemetry handles. `main()` fills these in once via _bind_telemetry(); they are
+# module-level so the thread targets below can log and record metrics without
+# threading `tel` through every signature.
+logger: Any = None
+_fetched_total: Any = None
+_emitted_total: Any = None
+_fetch_seconds: Any = None
+
+
+def _bind_telemetry(tel) -> None:
+    """Bind the module-level logger and metric handles from a configured Telemetry."""
+    global logger, _fetched_total, _emitted_total, _fetch_seconds
+    logger = tel.get_logger("weather2kafka")
+    _fetched_total = tel.counter(
+        "events_fetched_total",
+        "Forecast periods and radar payloads fetched from the upstream APIs.",
+    )
+    _emitted_total = tel.counter(
+        "events_emitted_total",
+        "Payloads produced to Kafka.",
+    )
+    _fetch_seconds = tel.histogram(
+        "fetch_seconds",
+        "Wall-clock time of an upstream fetch (forecast pull or radar download).",
+    )
 
 
 def now_dtz():
@@ -48,101 +87,75 @@ def thread_wrapper(target_func, args=(), name=""):
     return wrapped
 
 
-def _connect_weather_database() -> pg.Connection:
-    host = os.environ['SQL_HOSTNAME']
-    port = os.environ['SQL_PORT']
-    user = os.environ['SQL_USERNAME']
-    password = os.environ['SQL_PASSWORD']
-    database = 'NDOT'
-    retry_counter = 5
-    while retry_counter > 0:
-        try:
-            db_conn = pg.connect(
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                dbname=database,
-                autocommit=True)
-            return db_conn
-        except pg.OperationalError as e:
-            connection_error_context = e
-            logger.warning("Could not connect database for weather writing. Trying again....")
-            retry_counter -= 1
-            time.sleep(2)
-    else:
-        logger.error(f"Weather destination database parameters used were: "
-                      f"host={host}, port={port}, dbname={database}, user={user}")
-        raise pg.OperationalError(f"Could not connect database after all attempts.")
+# =============================================================================
+# Lifecycle — graceful shutdown.
+# =============================================================================
+
+_shutdown = False
 
 
-def _check_weather_database_connections(db_conn: pg.Connection) -> bool:
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute("SELECT 1=1;")
-            cur.fetchall()
-            return True
-    except Exception:
-        logger.warning("Weather database connection check failed. Attempting reconnect.")
-        return False
+def _on_signal(_signum, _frame) -> None:
+    """SIGTERM / SIGINT handler. Flip the flag; both feed loops notice."""
+    global _shutdown
+    _shutdown = True
 
+
+def _sleep_responsively(seconds: float) -> None:
+    """Sleep in small chunks so SIGTERM is responsive.
+
+    Never sleep a whole poll interval in one call — k8s SIGTERMs and waits
+    `terminationGracePeriodSeconds` (default 30 s) before SIGKILL, and the radar
+    cadence here is minutes.
+    """
+    deadline = time.monotonic() + seconds
+    while not _shutdown:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.5, remaining))
+
+
+# =============================================================================
+# Database connector — all weather SQL lives here.
+# =============================================================================
+
+class WeatherDb(Connector):
+    """Postgres connector with one insert method per weather table."""
+
+    def insert_weather_conditions(self, rows: list[dict]) -> None:
+        self.insert("laddms.weather_conditions", rows)
+
+    def insert_weather_radar(self, rows: list[dict]) -> None:
+        self.insert("laddms.weather_radar", rows)
 
 
 class WeatherForecastProducer:
-    def __init__(self, url, poll_interval_minutes, kafka_config):
+    def __init__(self, url, poll_interval_minutes, kafka: KafkaProducer, db: WeatherDb):
         self.url = url
+        # NOTE: the caller passes WEATHER_FORECAST_UPDATE_SECS in here, so the
+        # effective forecast cadence is that value in *minutes*. Preserved as-is
+        # — the deployed interval depends on it.
         self.poll_interval_seconds = poll_interval_minutes * 60
-        self.kc = kc.KafkaConfluentHelper(kafka_config)
+        self.kafka = kafka
+        self.db = db
 
         self.topic_name = "weather_forecast"
         self.partition_key = "0"
 
-        # Persistent DB connection for inserts
-        self.db_conn = _connect_weather_database()
-
 
     def insert_weather_batch(self, current_dict: dict, forecast_dicts: list[dict], write_time: dt.datetime):
         """
-        Insert the current observation and forecast periods into laddms.weather using a single write_time.
-        Ensures the class has a valid persistent DB connection before inserting.
+        Insert the current observation and forecast periods into laddms.weather_conditions
+        using a single write_time.
         """
-        # Ensure DB connection is valid; reconnect if needed
-        if not _check_weather_database_connections(self.db_conn):
-            try:
-                self.db_conn.close()
-            except Exception:
-                pass
-            self.db_conn = _connect_weather_database()
-
-        insert_sql = """
-            INSERT INTO laddms.weather_conditions (
-                write_time,
-                start_time,
-                end_time,
-                generate_time,
-                is_daytime,
-                temperature,
-                feels_like,
-                humidity,
-                short_forecast,
-                precip_chance,
-                precip_last3hours
-            )
-            VALUES (
-                %(write_time)s, %(start_time)s, %(end_time)s, %(generate_time)s, %(is_daytime)s, 
-                %(temperature)s, %(feels_like)s, %(humidity)s, %(short_forecast)s, 
-                %(precip_chance)s, %(precip_last3hours)s
-            );
-        """
-
-        # Use executemany for efficiency
-        with self.db_conn.cursor() as cur:
-            cur.executemany(insert_sql, [{'write_time': write_time, **d} for d in [current_dict] + forecast_dicts])
+        self.db.insert_weather_conditions(
+            [{'write_time': write_time, **d} for d in [current_dict] + forecast_dicts]
+        )
         logger.info(f"Inserted {len(forecast_dicts) + 1} rows into laddms.weather_conditions.")
 
 
     def wait(self):
-        time.sleep(self.poll_interval_seconds)
+        _sleep_responsively(self.poll_interval_seconds)
 
 
     def pull_weather_forecast(self, latitude, longitude, num_forecast_hours):
@@ -256,14 +269,18 @@ class WeatherForecastProducer:
 
 
     def produce_current_and_forecast_to_kafka(self, current_dict: dict, forecast_dicts: list[dict]):
-        # Produce to Kafka
-        self.kc.send(topic=self.topic_name, key=self.partition_key,
-                     json_data=json.dumps(current_dict),
-                     headers=[('service', b'weather'), ('datatype', b'current')])
+        # Produce to Kafka. The value is a JSON-encoded *string* (json.dumps of
+        # the dict, then serialized again by the connector) — that double
+        # encoding is what downstream consumers of this topic already parse, so
+        # don't "fix" it by passing the dict directly.
+        self.kafka.produce(self.topic_name, value=json.dumps(current_dict), key=self.partition_key,
+                           headers={'service': b'weather', 'datatype': b'current'})
+        _emitted_total.inc()
         for fd in forecast_dicts:
-            self.kc.send(topic=self.topic_name, key=self.partition_key,
-                         json_data=json.dumps(fd),
-                         headers=[('service', b'weather'), ('datatype', b'forecast')])
+            self.kafka.produce(self.topic_name, value=json.dumps(fd), key=self.partition_key,
+                               headers={'service': b'weather', 'datatype': b'forecast'})
+            _emitted_total.inc()
+        self.kafka.flush()
         logger.info(f"Produced {len(forecast_dicts) + 1} weather data points to Kafka.")
 
         # Now write to the database
@@ -277,64 +294,32 @@ class WeatherForecastProducer:
 
 
 class WeatherRadarProducer:
-    def __init__(self, url, lat_lon_range_list, poll_interval_seconds, kafka_config):
+    def __init__(self, url, lat_lon_range_list, poll_interval_seconds, kafka: KafkaProducer, db: WeatherDb):
         self.url = url
         self.poll_interval_seconds = poll_interval_seconds
-        self.kc = kc.KafkaConfluentHelper(kafka_config)
+        self.kafka = kafka
+        self.db = db
         self.location_list = lat_lon_range_list
 
         self.topic_name = "weather_radar"
         self.partition_key = "0"
 
-        # Persistent DB connection for inserts
-        self.db_conn = _connect_weather_database()
-
 
     def insert_weather_radar(self, radar_dicts: list[dict]):
         """
-        Insert the current observation and forecast periods into laddms.weather using a single write_time.
-        Ensures the class has a valid persistent DB connection before inserting.
+        Insert the clipped radar payloads into laddms.weather_radar using a single write_time.
         """
-        # Ensure DB connection is valid; reconnect if needed
-        if not _check_weather_database_connections(self.db_conn):
-            try:
-                self.db_conn.close()
-            except Exception:
-                pass
-            self.db_conn = _connect_weather_database()
-
-        insert_sql = """
-            INSERT INTO laddms.weather_radar (
-                write_time,
-                generate_time,
-                x_easting,
-                y_northing, 
-                radar_array,
-                center_lat,
-                center_lon,
-                range_miles,
-                utm_zone_epsg
-            )
-            VALUES (
-                %(write_time)s, %(generate_time)s, 
-                %(x_easting)s, %(y_northing)s, %(radar_array)s, 
-                %(center_lat)s, %(center_lon)s, %(range_miles)s, %(utm_zone_epsg)s
-            );
-        """
-
-        # Use executemany for efficiency
         write_time = now_dtz()
         for radar_dict in radar_dicts:
             radar_dict['x_easting'] = json.dumps(radar_dict['x_easting'])
             radar_dict['y_northing'] = json.dumps(radar_dict['y_northing'])
             radar_dict['radar_array'] = json.dumps(radar_dict['radar_array'])
-        with self.db_conn.cursor() as cur:
-            cur.executemany(insert_sql, [{'write_time': write_time, **d} for d in radar_dicts])
+        self.db.insert_weather_radar([{'write_time': write_time, **d} for d in radar_dicts])
         logger.info(f"Inserted {len(radar_dicts)} rows into laddms.weather_radar.")
 
 
     def wait(self):
-        time.sleep(self.poll_interval_seconds)
+        _sleep_responsively(self.poll_interval_seconds)
 
 
     def pull_weather_radar(self, plot_radar: bool = False):
@@ -461,28 +446,34 @@ class WeatherRadarProducer:
 
 
     def produce_radar_to_kafka(self, radar_dicts):
+        # Same double-encoded value shape as the forecast topic — see the note in
+        # WeatherForecastProducer.produce_current_and_forecast_to_kafka().
         for radar_dict in radar_dicts:
-            self.kc.send(topic=self.topic_name, key=self.partition_key,
-                         json_data=json.dumps(radar_dict),
-                         headers=[('service', b'weather'), ('datatype', b'radar')])
+            self.kafka.produce(self.topic_name, value=json.dumps(radar_dict), key=self.partition_key,
+                               headers={'service': b'weather', 'datatype': b'radar'})
+            _emitted_total.inc()
+        self.kafka.flush()
         logger.info(f"Produced {len(radar_dicts)} weather radar payloads to Kafka.")
 
 
-def update_weather_forecast(url, poll_interval, num_forecast_hours, locations: list[tuple], receiver_kafka_config):
-    forecast_receiver = WeatherForecastProducer(url, poll_interval, kafka_config=receiver_kafka_config)
+def update_weather_forecast(url, poll_interval, num_forecast_hours, locations: list[tuple],
+                            kafka: KafkaProducer, db: WeatherDb):
+    forecast_receiver = WeatherForecastProducer(url, poll_interval, kafka=kafka, db=db)
     logger.info("Created new instance of weather forecast receiver.")
-    while True:
+    while not _shutdown:
         for location in locations:
             lat, lon = location
             # 1) get the latest forecast
             try:
-                current_dict, forecast_dicts = forecast_receiver.pull_weather_forecast(latitude=lat, longitude=lon,
-                                                                                      num_forecast_hours=num_forecast_hours)
+                with _fetch_seconds.time():
+                    current_dict, forecast_dicts = forecast_receiver.pull_weather_forecast(
+                        latitude=lat, longitude=lon, num_forecast_hours=num_forecast_hours)
             except Exception as e:
                 logger.error("Failed to pull updated weather forecast.")
                 logger.exception(e, exc_info=True)
                 forecast_receiver.wait()
                 continue
+            _fetched_total.inc(len(forecast_dicts) + 1)
             # 2) produce forecast to Kafka
             try:
                 forecast_receiver.produce_current_and_forecast_to_kafka(current_dict=current_dict,
@@ -494,19 +485,22 @@ def update_weather_forecast(url, poll_interval, num_forecast_hours, locations: l
         forecast_receiver.wait()
 
 
-def update_weather_radar(url, lat_lon_range_location_list, poll_interval, plot_radar, receiver_kafka_config):
+def update_weather_radar(url, lat_lon_range_location_list, poll_interval, plot_radar,
+                         kafka: KafkaProducer, db: WeatherDb):
     radar_receiver = WeatherRadarProducer(url, lat_lon_range_location_list, poll_interval,
-                                          kafka_config=receiver_kafka_config)
+                                          kafka=kafka, db=db)
     logger.info("Created new instance of weather radar receiver.")
-    while True:
+    while not _shutdown:
         # 1) get the latest radar data
         try:
-            rcv_data = radar_receiver.pull_weather_radar(plot_radar=plot_radar)
+            with _fetch_seconds.time():
+                rcv_data = radar_receiver.pull_weather_radar(plot_radar=plot_radar)
         except Exception as e:
             logger.error("Failed to pull updated weather radar data.")
             logger.exception(e, exc_info=True)
             radar_receiver.wait()
             continue
+        _fetched_total.inc(len(rcv_data))
         # 2) produce radar data to Kafka
         try:
             radar_receiver.produce_radar_to_kafka(radar_dicts=rcv_data)
@@ -523,49 +517,28 @@ def update_weather_radar(url, lat_lon_range_location_list, poll_interval, plot_r
         radar_receiver.wait()
 
 
-if __name__ == "__main__":
-    common_kafka_config = {
-        'KAFKA_BOOTSTRAP': os.environ.get('KAFKA_BOOTSTRAP'),
-        'KAFKA_USER':  os.environ.get('KAFKA_USER'),
-        'KAFKA_PASSWORD': os.environ.get('KAFKA_PASSWORD'),
-        'KAFKA_CA_LOCATION': os.environ.get('KAFKA_CA_LOCATION', '/etc/viewlive/certs/strimzi-ca.crt'),
-    }
+def main() -> None:
+    global _shutdown
 
-    log_path = str(os.environ.get('LOG_PATH')) if os.environ.get('LOG_PATH') else "."
-    loggerFile = log_path + '/weather2kafka.log'
-    loggerFile = './weather2kafka.log'
-    print('Saving logs to: ' + loggerFile)
-    FORMAT = '%(asctime)s %(message)s'
+    # One call wires up JSON logging on stdout and the Prometheus /metrics
+    # endpoint on :9100. TELEMETRY_LOG_LEVEL=DEBUG replaces the old debug flag.
+    tel = configure_telemetry(service=SERVICE)
+    _bind_telemetry(tel)
 
-    debug = False  # set to False to disable console logging
-
-    root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
-
-    file_handler = logging.FileHandler(loggerFile)
-    file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
-    file_handler.setFormatter(logging.Formatter(FORMAT))
-    root_logger.addHandler(file_handler)
-
-    if debug:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(logging.Formatter(FORMAT))
-        root_logger.addHandler(console_handler)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
 
     logger.info("Starting 2x weather to Kafka producer threads.")
-    if True:
+
+    # One producer and one connector shared by both feed threads (the confluent
+    # producer and the connection pool are both thread-safe).
+    with (
+        KafkaProducer(KafkaEnvCredentials()) as kafka,
+        WeatherDb(DbEnvCredentials(), persistent=True) as db,
+    ):
         locations = [
             (float(os.environ.get('WEATHER_FORECAST_LAT')), float(os.environ.get('WEATHER_FORECAST_LON')))
         ]
-        threading.Thread(target=thread_wrapper(update_weather_forecast, args=(
-            os.environ.get('WEATHER_FORECAST_URL'),
-            int(os.environ.get('WEATHER_FORECAST_UPDATE_SECS')),
-            int(os.environ.get('WEATHER_NUM_FORECAST_HOURS')),
-            locations,
-            common_kafka_config), name="weather_forecast")).start()
-    if True:
         location_tuples = [
             (
                 float(os.environ.get('WEATHER_RADAR_LAT')),
@@ -573,9 +546,35 @@ if __name__ == "__main__":
                 float(os.environ.get('WEATHER_RADAR_RANGE_MI'))
             ),
         ]
-        threading.Thread(target=thread_wrapper(update_weather_radar, args=(
-            os.environ.get('WEATHER_RADAR_URL'),
-            location_tuples,
-            int(os.environ.get('WEATHER_RADAR_UPDATE_SECS')),
-            bool(int(os.environ.get('WEATHER_RADAR_PLOT'))),
-            common_kafka_config), name="weather_radar")).start()
+        threads = [
+            threading.Thread(target=thread_wrapper(update_weather_forecast, args=(
+                os.environ.get('WEATHER_FORECAST_URL'),
+                int(os.environ.get('WEATHER_FORECAST_UPDATE_SECS')),
+                int(os.environ.get('WEATHER_NUM_FORECAST_HOURS')),
+                locations,
+                kafka,
+                db), name="weather_forecast"), name="weather_forecast"),
+            threading.Thread(target=thread_wrapper(update_weather_radar, args=(
+                os.environ.get('WEATHER_RADAR_URL'),
+                location_tuples,
+                int(os.environ.get('WEATHER_RADAR_UPDATE_SECS')),
+                bool(int(os.environ.get('WEATHER_RADAR_PLOT'))),
+                kafka,
+                db), name="weather_radar"), name="weather_radar"),
+        ]
+        for thread in threads:
+            thread.start()
+
+        # Stay in the main thread so the signal handlers above can run; the feed
+        # loops check _shutdown between polls.
+        while not _shutdown and any(thread.is_alive() for thread in threads):
+            time.sleep(0.5)
+        _shutdown = True
+        for thread in threads:
+            thread.join(timeout=30)
+
+    logger.info("shutdown")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,10 +1,19 @@
-confluent-kafka==2.10.0
+# LV connectors — lower bounds only, never exact pins. They aren't on PyPI: the
+# Docker build installs them in its builder stage from the private Lab-Work
+# repos' default branches with a GitHub token, and locally you install them from
+# your sibling checkouts (pip install -e ../lv_kafka_connector) before running
+# pip install -r.
+lv_telemetry_connector>=1.0
+lv_kafka_connector>=1.0
+lv_db_connector>=1.0
+
+# Third-party. confluent-kafka and psycopg come transitively via the
+# connectors; don't list them here. rasterio/pyproj ship manylinux wheels with
+# GDAL and PROJ bundled, so no system packages are needed.
 requests
 python-dotenv
 rasterio
 pyproj
 beautifulsoup4
 matplotlib
-psycopg
-psycopg-binary
 tzdata
