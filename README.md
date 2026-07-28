@@ -18,9 +18,12 @@ The pre-1.0 `SQL_*` names and `LOG_PATH` are gone: the deployment env must
 supply `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` and now also
 `DB_DBNAME` (the database name used to be hardcoded to `NDOT`).
 
-The Strimzi CA cert defaults to `/etc/viewlive/certs/strimzi-ca.crt`, mounted
-read-only into the container. Override the path with `KAFKA_CA_LOCATION`, or
-skip the mount entirely by passing the PEM inline via `KAFKA_CA_CERT`.
+`KAFKA_CA_LOCATION` defaults to `strimzi-ca.crt`, resolved relative to the
+container's `/app` working directory — hence the `-v` below mounting the cert
+there read-only. Set `KAFKA_CA_LOCATION` to an absolute path if the cert lives
+elsewhere (a deployment mounting `/etc/viewlive/certs` would do that), or skip
+the mount entirely by supplying `KAFKA_CA_CERT` as an inline PEM string, which
+takes precedence.
 
 ## Local run
 
@@ -42,7 +45,7 @@ builder stage:
 docker build --build-arg GITHUB_TOKEN=$GITHUB_TOKEN -t weather2kafka:0.0 .
 docker run \
   --env-file path/to/1.env \
-  -v /etc/viewlive/certs:/etc/viewlive/certs:ro \
+  -v $(pwd)/strimzi-ca.crt:/app/strimzi-ca.crt:ro \
   -p 9100:9100 \
   weather2kafka:0.0
 ```
