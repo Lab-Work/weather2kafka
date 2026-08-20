@@ -3,9 +3,9 @@
 # repos' default branches with a GitHub token, and locally you install them from
 # your sibling checkouts (pip install -e ../lv_kafka_connector) before running
 # pip install -r.
-lv_telemetry_connector>=1.0
-lv_kafka_connector>=1.0
-lv_db_connector>=1.0
+./lv_telemetry_connector
+./lv_kafka_connector
+./lv_db_connector
 
 # Third-party. confluent-kafka and psycopg come transitively via the
 # connectors; don't list them here. rasterio/pyproj ship manylinux wheels with
