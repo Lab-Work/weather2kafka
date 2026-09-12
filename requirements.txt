@@ -9,7 +9,12 @@
 
 # Third-party. confluent-kafka and psycopg come transitively via the
 # connectors; don't list them here. rasterio/pyproj ship manylinux wheels with
-# GDAL and PROJ bundled, so no system packages are needed.
+# GDAL and PROJ bundled, so no system packages are needed. netCDF4 is the same
+# story via its cp311-abi3 manylinux_2_28 wheel (HDF5 and the netCDF C library
+# bundled); the python:3.12 base image is bookworm, glibc 2.36, so it resolves.
+#
+# rasterio also reads the HRRR GRIB2 files through GDAL's GRIB driver — that is
+# why the cloud layer feed needs no separate eccodes/cfgrib stack.
 requests
 python-dotenv
 rasterio
@@ -17,3 +22,5 @@ pyproj
 beautifulsoup4
 matplotlib
 tzdata
+netCDF4
+

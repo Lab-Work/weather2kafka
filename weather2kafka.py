@@ -1,8 +1,10 @@
-"""weather2kafka — NWS forecast/current conditions and NOAA MRMS radar to Kafka + Postgres.
+"""weather2kafka — NWS forecast, NOAA MRMS radar and satellite/model clouds to Kafka + Postgres.
 
-Two independent feeds run on their own threads with their own cadences:
-    * weather_forecast — api.weather.gov points/stations/hourly forecast
-    * weather_radar    — MRMS BREF_QCD GeoTIFF, clipped to a lat/lon radius
+Four independent feeds run on their own threads with their own cadences:
+    * weather_forecast     — api.weather.gov points/stations/hourly forecast
+    * weather_radar        — MRMS BREF_QCD GeoTIFF, clipped to a lat/lon radius
+    * weather_clouds       — GOES-19 ABI L2 observed cloud fields, 2 km
+    * weather_cloud_layers — HRRR low/middle/high cloud fraction, 3 km + forecast
 
     Run:        python weather2kafka.py
     Logs:       JSON on stdout (Loki-friendly)
@@ -15,6 +17,7 @@ import datetime as dt
 import gzip
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -26,13 +29,15 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
+import netCDF4
 import numpy as np
 import rasterio
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from pyproj import CRS, Transformer
-from rasterio.transform import xy
+from rasterio.io import MemoryFile
+from rasterio.transform import rowcol, xy
 
 from lv_db_connector import Connector, DbEnvCredentials
 from lv_kafka_connector import KafkaEnvCredentials, KafkaProducer
@@ -127,6 +132,12 @@ class WeatherDb(Connector):
 
     def insert_weather_radar(self, rows: list[dict]) -> None:
         self.insert("laddms.weather_radar", rows)
+
+    def insert_weather_clouds(self, rows: list[dict]) -> None:
+        self.insert("laddms.weather_clouds", rows)
+
+    def insert_weather_cloud_layers(self, rows: list[dict]) -> None:
+        self.insert("laddms.weather_cloud_layers", rows)
 
 
 class WeatherForecastProducer:
@@ -456,6 +467,453 @@ class WeatherRadarProducer:
         logger.info(f"Produced {len(radar_dicts)} weather radar payloads to Kafka.")
 
 
+# =============================================================================
+# Cloud feeds — GOES-19 ABI (observed) and HRRR (layered + forecast).
+#
+# Clouds are a genuinely different field from precipitation, not a by-product of
+# it: on a typical overcast day 60% of this box is cloud-covered while radar
+# paints echoes over ~2% of it. Neither the radar feed nor the forecast's
+# `short_forecast` text answers "where are the clouds", so these two feeds do.
+#
+#   weather_clouds        GOES-19 ABI L2 — what the satellite sees now. 2 km,
+#                         a new CONUS scan every ~10 min, ~3 min behind real
+#                         time. Cloud probability, 4-level mask, top height,
+#                         optical depth and top phase.
+#   weather_cloud_layers  HRRR — low/middle/high cloud fraction plus cloud base
+#                         and top height. 3 km, hourly, and because HRRR
+#                         publishes forecast hours a viewer can animate forward
+#                         rather than only render the present.
+#
+# Both emit the radar feed's payload shape: 2-D JSON arrays over a per-pixel UTM
+# coordinate grid, so a consumer that already draws `weather_radar` draws these.
+# =============================================================================
+
+# The NOAA open-data buckets are public — anonymous HTTPS, no AWS credentials.
+GOES_BUCKET_URL = "https://noaa-goes19.s3.amazonaws.com"
+HRRR_BUCKET_URL = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
+
+# (S3 product prefix, [(netCDF variable, output column), ...]).
+#
+# Every product here is a CONUS ("...C") sector file on the same 2 km ABI fixed
+# grid — identical x/y axes, and the scans are published in lockstep — so one
+# coordinate array pair describes all of them and they can share a row.
+#
+# ACHA2KMC, not ACHAC: the plain ACHAC cloud-top-height product is 10 km, which
+# is four pixels across a 30-mile box and useless here.
+GOES_CLOUD_PRODUCTS = [
+    ("ABI-L2-ACMC", [("Cloud_Probabilities", "cloud_probability"), ("ACM", "cloud_mask")]),
+    ("ABI-L2-ACHA2KMC", [("HT", "cloud_top_height")]),
+    ("ABI-L2-CODC", [("COD", "cloud_optical_depth")]),
+    ("ABI-L2-ACTPC", [("Phase", "cloud_top_phase")]),
+]
+
+# GRIB band selectors, matched against GDAL's GRIB_ELEMENT / GRIB_SHORT_NAME
+# tags after the block is opened. The matching .idx rows are (parameter, level)
+# — the index is searched by name because HRRR message *numbers* shift between
+# forecast hours (the cloud block sits at 112-121 in f00 but 115-124 in f03),
+# so anything that hardcodes numbers silently reads the wrong fields.
+HRRR_CLOUD_FIELDS = [
+    ("LCDC", "low cloud layer", "0-LCY", "cloud_cover_low"),
+    ("MCDC", "middle cloud layer", "0-MCY", "cloud_cover_mid"),
+    ("HCDC", "high cloud layer", "0-HCY", "cloud_cover_high"),
+    ("TCDC", "entire atmosphere", "0-EATM", "cloud_cover_total"),
+    ("HGT", "cloud base", "0-CBL", "cloud_base_height"),
+    ("HGT", "cloud top", "0-CTL", "cloud_top_height"),
+]
+
+# HRRR writes 9999 into the cloud base/top height fields where there is no
+# cloud, and sets no GRIB nodata value to say so. It is unambiguous: 9999.0
+# appears exactly, in 44-75% of cells, with a clean gap below it, while real
+# cloud tops run well past it (19 km) as non-integral floats.
+HRRR_NO_CLOUD_HEIGHT = 9999.0
+
+# How far back to look for a usable upstream file before giving up.
+GOES_SCAN_SEARCH_HOURS = 2
+HRRR_RUN_SEARCH_HOURS = 6
+
+
+def utm_crs_for_center(center_lat, center_lon):
+    """UTM CRS and EPSG code for a center point — the radar feed's zone maths."""
+    zone = int((center_lon + 180) // 6) + 1
+    zone = min(60, max(1, zone))
+    utm_epsg = (326 if center_lat >= 0 else 327) * 100 + zone
+    return CRS.from_epsg(utm_epsg), utm_epsg
+
+
+def grid_to_json_safe(array, decimals=2):
+    """Round a float grid and swap every non-finite cell for null.
+
+    json.dumps() happily writes a bare `NaN` token, which is not valid JSON and
+    breaks any strict parser downstream. Cloud grids are full of gaps — clear
+    pixels have no cloud-top height — so this matters on every message.
+    """
+    rounded = np.round(np.asarray(array, dtype='float64'), decimals)
+    return np.where(np.isfinite(rounded), rounded, None).tolist()
+
+
+class WeatherCloudProducer:
+    """GOES-19 ABI L2 cloud fields, clipped to a lat/lon radius.
+
+    One row per location per scan holding every field in GOES_CLOUD_PRODUCTS on
+    a shared UTM coordinate grid.
+    """
+
+    def __init__(self, bucket_url, lat_lon_range_list, poll_interval_seconds, kafka: KafkaProducer, db: WeatherDb):
+        self.bucket_url = bucket_url
+        self.poll_interval_seconds = poll_interval_seconds
+        self.kafka = kafka
+        self.db = db
+        self.location_list = lat_lon_range_list
+
+        self.topic_name = "weather_clouds"
+        self.partition_key = "0"
+
+
+    def insert_weather_clouds(self, cloud_dicts: list[dict]):
+        """Insert the clipped cloud payloads into laddms.weather_clouds."""
+        write_time = now_dtz()
+        rows = []
+        for cloud_dict in cloud_dicts:
+            row = dict(cloud_dict)
+            for column, value in row.items():
+                if isinstance(value, list):
+                    row[column] = json.dumps(value)
+            rows.append({'write_time': write_time, **row})
+        self.db.insert_weather_clouds(rows)
+        logger.info(f"Inserted {len(rows)} rows into laddms.weather_clouds.")
+
+
+    def wait(self):
+        _sleep_responsively(self.poll_interval_seconds)
+
+
+    def list_product_scans(self, product):
+        """Map scan-start token -> S3 key for `product` over the recent hours.
+
+        GOES keys are laid out <product>/<year>/<day-of-year>/<hour>/, so an
+        hour boundary needs both hours listed to see the newest scan.
+        """
+        scans = {}
+        for hours_back in range(GOES_SCAN_SEARCH_HOURS):
+            moment = dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(hours=hours_back)
+            prefix = f"{product}/{moment.year}/{moment.timetuple().tm_yday:03d}/{moment:%H}/"
+            response = requests.get(
+                self.bucket_url,
+                params={'list-type': '2', 'prefix': prefix, 'max-keys': '400'},
+                timeout=60,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"Failed to list GOES product {product}: HTTP {response.status_code}")
+            for key in re.findall(r'<Key>([^<]+)</Key>', response.text):
+                token = re.search(r'_s(\d{14})_', key)
+                if token is not None:
+                    scans[token.group(1)] = key
+        return scans
+
+
+    def read_product_grid(self, key, variables):
+        """Download one GOES file and return (columns, x_utm, y_utm, scan_start).
+
+        The ABI fixed grid stores x/y as *scan angles*; multiplying by the
+        perspective point height converts them to metres in the geostationary
+        projection, which is then reprojected straight to UTM.
+        """
+        response = requests.get(f"{self.bucket_url}/{key}", timeout=180)
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to download GOES file {key}: HTTP {response.status_code}")
+
+        dataset = netCDF4.Dataset('inmemory.nc', memory=response.content)
+        try:
+            projection = dataset.variables['goes_imager_projection']
+            satellite_height = float(projection.perspective_point_height)
+            geos_crs = CRS.from_proj4(
+                f"+proj=geos +h={satellite_height} "
+                f"+lon_0={float(projection.longitude_of_projection_origin)} "
+                f"+sweep={projection.sweep_angle_axis} "
+                f"+a={float(projection.semi_major_axis)} +b={float(projection.semi_minor_axis)}"
+            )
+            # Read the coordinate axes BEFORE auto-scaling is switched off below:
+            # x/y are packed int16 and are meaningless without their scale_factor.
+            grid_x = np.asarray(dataset.variables['x'][:], dtype='float64') * satellite_height
+            grid_y = np.asarray(dataset.variables['y'][:], dtype='float64') * satellite_height
+            scan_start = dataset.time_coverage_start
+
+            columns = {}
+            windows = {}
+            for center_lat, center_lon, range_miles in self.location_list:
+                to_geos = Transformer.from_crs("EPSG:4326", geos_crs, always_xy=True)
+                center_x, center_y = to_geos.transform(center_lon, center_lat)
+                buffer_m = 1609.34 * range_miles
+                x_indices = np.where((grid_x >= center_x - buffer_m) & (grid_x <= center_x + buffer_m))[0]
+                y_indices = np.where((grid_y >= center_y - buffer_m) & (grid_y <= center_y + buffer_m))[0]
+                if x_indices.size == 0 or y_indices.size == 0:
+                    raise RuntimeError(
+                        f"Location ({center_lat}, {center_lon}) falls outside the GOES CONUS sector."
+                    )
+                windows[(center_lat, center_lon, range_miles)] = (y_indices, x_indices)
+
+            # Auto-masking has to come off for the data variables: ACM's
+            # Cloud_Probabilities declares valid_range = [0, 1] in *physical*
+            # units while storing packed uint16, so netCDF4 masks all 100% of
+            # the array and the field silently reads back as entirely NaN.
+            # Unpack by hand against _FillValue instead.
+            dataset.set_auto_maskandscale(False)
+            for variable_name, column in variables:
+                variable = dataset.variables[variable_name]
+                fill_value = float(getattr(variable, '_FillValue', np.nan))
+                scale_factor = float(getattr(variable, 'scale_factor', 1.0))
+                add_offset = float(getattr(variable, 'add_offset', 0.0))
+                for location, (y_indices, x_indices) in windows.items():
+                    packed = np.asarray(
+                        variable[y_indices.min():y_indices.max() + 1, x_indices.min():x_indices.max() + 1],
+                        dtype='float64',
+                    )
+                    unpacked = np.where(packed == fill_value, np.nan, packed * scale_factor + add_offset)
+                    columns.setdefault(location, {})[column] = unpacked
+        finally:
+            dataset.close()
+
+        return columns, grid_x, grid_y, windows, geos_crs, scan_start
+
+
+    def pull_weather_clouds(self):
+        # Take the newest scan present in EVERY product, not each product's own
+        # newest. They are published a couple of minutes apart, so the latest
+        # ACM regularly has no matching COD yet, and mixing scans would put
+        # fields from different instants in one row.
+        product_scans = [(product, variables, self.list_product_scans(product))
+                         for product, variables in GOES_CLOUD_PRODUCTS]
+        common_scans = set(product_scans[0][2])
+        for _, _, scans in product_scans[1:]:
+            common_scans.intersection_update(scans)
+        if not common_scans:
+            raise RuntimeError("No GOES scan time is present in every cloud product.")
+        scan_token = max(common_scans)
+        # Token is YYYYDDDHHMMSSt — the trailing digit is tenths of a second.
+        generate_time = dt.datetime.strptime(scan_token[:13], '%Y%j%H%M%S').replace(tzinfo=dt.timezone.utc)
+        logger.info(f"Fetching GOES cloud scan {scan_token} across {len(product_scans)} products.")
+
+        fields_by_location = {}
+        geometry = None
+        for product, variables, scans in product_scans:
+            columns, grid_x, grid_y, windows, geos_crs, _ = self.read_product_grid(scans[scan_token], variables)
+            for location, location_columns in columns.items():
+                fields_by_location.setdefault(location, {}).update(location_columns)
+            geometry = (grid_x, grid_y, windows, geos_crs)
+
+        grid_x, grid_y, windows, geos_crs = geometry
+        cloud_dicts = []
+        for (center_lat, center_lon, range_miles), fields in fields_by_location.items():
+            y_indices, x_indices = windows[(center_lat, center_lon, range_miles)]
+            window_x = grid_x[x_indices.min():x_indices.max() + 1]
+            window_y = grid_y[y_indices.min():y_indices.max() + 1]
+            mesh_x, mesh_y = np.meshgrid(window_x, window_y)
+
+            utm_crs, utm_epsg = utm_crs_for_center(center_lat, center_lon)
+            to_utm = Transformer.from_crs(geos_crs, utm_crs, always_xy=True)
+            utm_x, utm_y = to_utm.transform(mesh_x, mesh_y)
+
+            cloud_dict = {
+                'generate_time': generate_time.isoformat(),
+                'satellite': 'G19',
+                'x_easting': grid_to_json_safe(utm_x),
+                'y_northing': grid_to_json_safe(utm_y),
+                'center_lat': center_lat,
+                'center_lon': center_lon,
+                'range_miles': range_miles,
+                'utm_zone_epsg': utm_epsg,
+            }
+            for column, values in fields.items():
+                cloud_dict[column] = grid_to_json_safe(values)
+            cloud_dicts.append(cloud_dict)
+
+        return cloud_dicts
+
+
+    def produce_clouds_to_kafka(self, cloud_dicts):
+        # Same double-encoded value shape as the other topics — see the note in
+        # WeatherForecastProducer.produce_current_and_forecast_to_kafka().
+        for cloud_dict in cloud_dicts:
+            self.kafka.produce(self.topic_name, value=json.dumps(cloud_dict), key=self.partition_key,
+                               headers={'service': b'weather', 'datatype': b'clouds'})
+            _emitted_total.inc()
+        self.kafka.flush()
+        logger.info(f"Produced {len(cloud_dicts)} cloud payloads to Kafka.")
+
+
+class WeatherCloudLayerProducer:
+    """HRRR low/middle/high cloud fraction and cloud base/top height.
+
+    One row per location per forecast hour. Forecast hour 0 is the analysis —
+    the model's best estimate of the present — and anything above it lets a
+    viewer animate cloud cover forward.
+    """
+
+    def __init__(self, bucket_url, lat_lon_range_list, forecast_hours, poll_interval_seconds,
+                 kafka: KafkaProducer, db: WeatherDb):
+        self.bucket_url = bucket_url
+        self.poll_interval_seconds = poll_interval_seconds
+        self.kafka = kafka
+        self.db = db
+        self.location_list = lat_lon_range_list
+        self.forecast_hours = forecast_hours
+
+        self.topic_name = "weather_cloud_layers"
+        self.partition_key = "0"
+
+
+    def insert_weather_cloud_layers(self, layer_dicts: list[dict]):
+        """Insert the clipped cloud-layer payloads into laddms.weather_cloud_layers."""
+        write_time = now_dtz()
+        rows = []
+        for layer_dict in layer_dicts:
+            row = dict(layer_dict)
+            for column, value in row.items():
+                if isinstance(value, list):
+                    row[column] = json.dumps(value)
+            rows.append({'write_time': write_time, **row})
+        self.db.insert_weather_cloud_layers(rows)
+        logger.info(f"Inserted {len(rows)} rows into laddms.weather_cloud_layers.")
+
+
+    def wait(self):
+        _sleep_responsively(self.poll_interval_seconds)
+
+
+    def grib_url(self, run_time, forecast_hour):
+        return (f"{self.bucket_url}/hrrr.{run_time:%Y%m%d}/conus/"
+                f"hrrr.t{run_time:%H}z.wrfsfcf{forecast_hour:02d}.grib2")
+
+
+    def latest_run(self):
+        """Newest HRRR run whose furthest needed forecast hour has been published.
+
+        A run's files land progressively over roughly an hour, so the newest run
+        directory on the bucket is regularly incomplete. Probe backwards and
+        take the first run that has the last hour we intend to read.
+        """
+        furthest_hour = max(self.forecast_hours)
+        now = dt.datetime.now(tz=dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        for hours_back in range(1, HRRR_RUN_SEARCH_HOURS + 1):
+            run_time = now - dt.timedelta(hours=hours_back)
+            response = requests.head(f"{self.grib_url(run_time, furthest_hour)}.idx", timeout=30)
+            if response.status_code == 200:
+                return run_time
+        raise RuntimeError(
+            f"No HRRR run with forecast hour {furthest_hour} found in the last {HRRR_RUN_SEARCH_HOURS} hours."
+        )
+
+
+    def pull_cloud_layers_for_hour(self, run_time, forecast_hour):
+        """Fetch and clip one HRRR forecast hour, returning a dict per location."""
+        grib_url = self.grib_url(run_time, forecast_hour)
+
+        # The .idx sidecar lists every GRIB message with its byte offset, so the
+        # cloud fields can be pulled without downloading the ~130 MB file.
+        index_response = requests.get(f"{grib_url}.idx", timeout=60)
+        if index_response.status_code != 200:
+            raise RuntimeError(f"Failed to fetch HRRR index {grib_url}.idx: HTTP {index_response.status_code}")
+        index_rows = [line.split(':') for line in index_response.text.strip().split('\n')]
+        message_starts = {int(row[0]): int(row[1]) for row in index_rows}
+
+        wanted = {(parameter, level) for parameter, level, _, _ in HRRR_CLOUD_FIELDS}
+        message_numbers = [int(row[0]) for row in index_rows if (row[3], row[4]) in wanted]
+        if len(message_numbers) < len(wanted):
+            raise RuntimeError(
+                f"HRRR index for f{forecast_hour:02d} is missing cloud fields "
+                f"(found {len(message_numbers)} of {len(wanted)})."
+            )
+
+        # One contiguous range over the whole cloud block instead of a request
+        # per field. The block has a few unrelated messages interleaved; they
+        # decode into extra bands that are simply not selected below.
+        first_byte = message_starts[min(message_numbers)]
+        last_message = max(message_numbers)
+        last_byte = message_starts[last_message + 1] - 1 if (last_message + 1) in message_starts else ''
+        block_response = requests.get(grib_url, headers={'Range': f'bytes={first_byte}-{last_byte}'}, timeout=180)
+        if block_response.status_code not in (200, 206):
+            raise RuntimeError(f"Failed to download HRRR block {grib_url}: HTTP {block_response.status_code}")
+
+        valid_time = run_time + dt.timedelta(hours=forecast_hour)
+        layer_dicts = []
+        with MemoryFile(block_response.content) as memfile, memfile.open() as src:
+            # Select bands by their GRIB tags rather than by position: the block
+            # contains unrelated interleaved messages and its composition shifts
+            # between forecast hours.
+            band_for_column = {}
+            for band in range(1, src.count + 1):
+                tags = src.tags(band)
+                for parameter, _, short_name, column in HRRR_CLOUD_FIELDS:
+                    if tags.get('GRIB_ELEMENT') == parameter and tags.get('GRIB_SHORT_NAME') == short_name:
+                        band_for_column[column] = band
+            missing = [column for _, _, _, column in HRRR_CLOUD_FIELDS if column not in band_for_column]
+            if missing:
+                raise RuntimeError(f"HRRR block for f{forecast_hour:02d} is missing bands for: {missing}")
+
+            to_grid = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            for center_lat, center_lon, range_miles in self.location_list:
+                center_x, center_y = to_grid.transform(center_lon, center_lat)
+                buffer_m = 1609.34 * range_miles
+                row_top, col_left = rowcol(src.transform, center_x - buffer_m, center_y + buffer_m)
+                row_bottom, col_right = rowcol(src.transform, center_x + buffer_m, center_y - buffer_m)
+                row_top = max(0, min(int(row_top), src.height - 1))
+                row_bottom = max(0, min(int(row_bottom), src.height - 1))
+                col_left = max(0, min(int(col_left), src.width - 1))
+                col_right = max(0, min(int(col_right), src.width - 1))
+                window = rasterio.windows.Window.from_slices(
+                    (row_top, row_bottom + 1), (col_left, col_right + 1))
+
+                layer_dict = {
+                    'generate_time': run_time.isoformat(),
+                    'valid_time': valid_time.isoformat(),
+                    'forecast_hour': forecast_hour,
+                    'center_lat': center_lat,
+                    'center_lon': center_lon,
+                    'range_miles': range_miles,
+                }
+                for column, band in band_for_column.items():
+                    values = src.read(band, window=window).astype('float64')
+                    if column.endswith('_height'):
+                        values = np.where(values == HRRR_NO_CLOUD_HEIGHT, np.nan, values)
+                    layer_dict[column] = grid_to_json_safe(values)
+
+                grid_rows, grid_cols = np.meshgrid(
+                    np.arange(row_top, row_bottom + 1), np.arange(col_left, col_right + 1), indexing='ij')
+                flat_x, flat_y = xy(src.transform, grid_rows.flatten(), grid_cols.flatten(), offset='center')
+                projected_x = np.array(flat_x).reshape(grid_rows.shape)
+                projected_y = np.array(flat_y).reshape(grid_rows.shape)
+
+                utm_crs, utm_epsg = utm_crs_for_center(center_lat, center_lon)
+                to_utm = Transformer.from_crs(src.crs, utm_crs, always_xy=True)
+                utm_x, utm_y = to_utm.transform(projected_x, projected_y)
+                layer_dict['x_easting'] = grid_to_json_safe(utm_x)
+                layer_dict['y_northing'] = grid_to_json_safe(utm_y)
+                layer_dict['utm_zone_epsg'] = utm_epsg
+                layer_dicts.append(layer_dict)
+
+        return layer_dicts
+
+
+    def pull_weather_cloud_layers(self):
+        run_time = self.latest_run()
+        logger.info(f"Fetching HRRR cloud layers from run {run_time:%Y-%m-%d %H}z, "
+                    f"forecast hours {self.forecast_hours}.")
+        layer_dicts = []
+        for forecast_hour in self.forecast_hours:
+            layer_dicts.extend(self.pull_cloud_layers_for_hour(run_time, forecast_hour))
+        return layer_dicts
+
+
+    def produce_cloud_layers_to_kafka(self, layer_dicts):
+        # Same double-encoded value shape as the other topics.
+        for layer_dict in layer_dicts:
+            self.kafka.produce(self.topic_name, value=json.dumps(layer_dict), key=self.partition_key,
+                               headers={'service': b'weather', 'datatype': b'cloud_layers'})
+            _emitted_total.inc()
+        self.kafka.flush()
+        logger.info(f"Produced {len(layer_dicts)} cloud layer payloads to Kafka.")
+
+
 def update_weather_forecast(url, poll_interval, num_forecast_hours, locations: list[tuple],
                             kafka: KafkaProducer, db: WeatherDb):
     forecast_receiver = WeatherForecastProducer(url, poll_interval, kafka=kafka, db=db)
@@ -517,6 +975,70 @@ def update_weather_radar(url, lat_lon_range_location_list, poll_interval, plot_r
         radar_receiver.wait()
 
 
+def update_weather_clouds(url, lat_lon_range_location_list, poll_interval,
+                          kafka: KafkaProducer, db: WeatherDb):
+    cloud_receiver = WeatherCloudProducer(url, lat_lon_range_location_list, poll_interval,
+                                          kafka=kafka, db=db)
+    logger.info("Created new instance of weather cloud receiver.")
+    while not _shutdown:
+        # 1) get the latest GOES cloud scan
+        try:
+            with _fetch_seconds.time():
+                rcv_data = cloud_receiver.pull_weather_clouds()
+        except Exception as e:
+            logger.error("Failed to pull updated GOES cloud data.")
+            logger.exception(e, exc_info=True)
+            cloud_receiver.wait()
+            continue
+        _fetched_total.inc(len(rcv_data))
+        # 2) produce cloud data to Kafka
+        try:
+            cloud_receiver.produce_clouds_to_kafka(cloud_dicts=rcv_data)
+        except Exception as e:
+            logger.error("Failed to assemble and send cloud data to Kafka.")
+            logger.exception(e, exc_info=True)
+        # 3) insert to database
+        try:
+            cloud_receiver.insert_weather_clouds(cloud_dicts=rcv_data)
+        except Exception as e:
+            logger.error("Failed to insert weather cloud data.")
+            logger.exception(e, exc_info=True)
+        # 4) invoke WAIT on the receiver object
+        cloud_receiver.wait()
+
+
+def update_weather_cloud_layers(url, lat_lon_range_location_list, forecast_hours, poll_interval,
+                                kafka: KafkaProducer, db: WeatherDb):
+    layer_receiver = WeatherCloudLayerProducer(url, lat_lon_range_location_list, forecast_hours,
+                                               poll_interval, kafka=kafka, db=db)
+    logger.info("Created new instance of weather cloud layer receiver.")
+    while not _shutdown:
+        # 1) get the latest HRRR run
+        try:
+            with _fetch_seconds.time():
+                rcv_data = layer_receiver.pull_weather_cloud_layers()
+        except Exception as e:
+            logger.error("Failed to pull updated HRRR cloud layer data.")
+            logger.exception(e, exc_info=True)
+            layer_receiver.wait()
+            continue
+        _fetched_total.inc(len(rcv_data))
+        # 2) produce cloud layers to Kafka
+        try:
+            layer_receiver.produce_cloud_layers_to_kafka(layer_dicts=rcv_data)
+        except Exception as e:
+            logger.error("Failed to assemble and send cloud layer data to Kafka.")
+            logger.exception(e, exc_info=True)
+        # 3) insert to database
+        try:
+            layer_receiver.insert_weather_cloud_layers(layer_dicts=rcv_data)
+        except Exception as e:
+            logger.error("Failed to insert weather cloud layer data.")
+            logger.exception(e, exc_info=True)
+        # 4) invoke WAIT on the receiver object
+        layer_receiver.wait()
+
+
 def main() -> None:
     global _shutdown
 
@@ -528,7 +1050,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    logger.info("Starting 2x weather to Kafka producer threads.")
+    logger.info("Starting 4x weather to Kafka producer threads.")
 
     # One producer and one connector shared by both feed threads (the confluent
     # producer and the connection pool are both thread-safe).
@@ -546,6 +1068,18 @@ def main() -> None:
                 float(os.environ.get('WEATHER_RADAR_RANGE_MI'))
             ),
         ]
+        cloud_location_tuples = [
+            (
+                float(os.environ.get('WEATHER_CLOUD_LAT')),
+                float(os.environ.get('WEATHER_CLOUD_LON')),
+                float(os.environ.get('WEATHER_CLOUD_RANGE_MI'))
+            ),
+        ]
+        # "0,1,2,3" -> [0, 1, 2, 3]. Hour 0 is the HRRR analysis (the model's
+        # present); the rest are the forecast hours a viewer animates through.
+        cloud_layer_forecast_hours = [
+            int(hour) for hour in os.environ.get('WEATHER_CLOUD_LAYER_FORECAST_HOURS').split(',')
+        ]
         threads = [
             threading.Thread(target=thread_wrapper(update_weather_forecast, args=(
                 os.environ.get('WEATHER_FORECAST_URL'),
@@ -561,6 +1095,19 @@ def main() -> None:
                 bool(int(os.environ.get('WEATHER_RADAR_PLOT'))),
                 kafka,
                 db), name="weather_radar"), name="weather_radar"),
+            threading.Thread(target=thread_wrapper(update_weather_clouds, args=(
+                os.environ.get('WEATHER_CLOUD_URL'),
+                cloud_location_tuples,
+                int(os.environ.get('WEATHER_CLOUD_UPDATE_SECS')),
+                kafka,
+                db), name="weather_clouds"), name="weather_clouds"),
+            threading.Thread(target=thread_wrapper(update_weather_cloud_layers, args=(
+                os.environ.get('WEATHER_CLOUD_LAYER_URL'),
+                cloud_location_tuples,
+                cloud_layer_forecast_hours,
+                int(os.environ.get('WEATHER_CLOUD_LAYER_UPDATE_SECS')),
+                kafka,
+                db), name="weather_cloud_layers"), name="weather_cloud_layers"),
         ]
         for thread in threads:
             thread.start()
