@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS laddms.weather_clouds (
     cloud_top_height    JSON,
     cloud_optical_depth JSON,
     cloud_top_phase     JSON,
+    sky_coverage        REAL,
+    cloud_type          TEXT,
+    cloud_density       REAL,
+    cloud_top_height_m  REAL,
     center_lat          DOUBLE PRECISION,
     center_lon          DOUBLE PRECISION,
     range_miles         REAL,
@@ -80,6 +84,10 @@ COMMENT ON COLUMN laddms.weather_clouds.cloud_mask IS 'Four-level cloud mask: 0=
 COMMENT ON COLUMN laddms.weather_clouds.cloud_top_height IS 'Units: metres. NULL where the pixel is clear, so this doubles as a cloud extent mask.';
 COMMENT ON COLUMN laddms.weather_clouds.cloud_optical_depth IS 'Cloud optical depth at 640 nm, dimensionless. Higher is more opaque; use it to drive render opacity.';
 COMMENT ON COLUMN laddms.weather_clouds.cloud_top_phase IS 'Cloud top phase: 0=clear sky, 1=liquid water, 2=supercooled liquid water, 3=mixed phase, 4=ice, 5=unknown.';
+COMMENT ON COLUMN laddms.weather_clouds.sky_coverage IS 'Scalar summary: mean cloud probability over the box, as a percent of area covered.';
+COMMENT ON COLUMN laddms.weather_clouds.cloud_type IS 'Scalar summary: DERIVED cloud genus (ISCCP-style, from cloud top height and optical depth) -- not an observed product. One of cumulus, stratocumulus, stratus, altocumulus, altostratus, nimbostratus, cirrus, cirrostratus, deep_convection, or clear.';
+COMMENT ON COLUMN laddms.weather_clouds.cloud_density IS 'Scalar summary: mean cloud optical depth over cloudy pixels. Dimensionless; higher is more opaque.';
+COMMENT ON COLUMN laddms.weather_clouds.cloud_top_height_m IS 'Scalar summary: median cloud top height over cloudy pixels. Units: metres.';
 
 SELECT create_hypertable(
     'laddms.weather_clouds',
@@ -92,8 +100,6 @@ SELECT create_hypertable(
 CREATE TABLE IF NOT EXISTS laddms.weather_cloud_layers (
     write_time          TIMESTAMPTZ NOT NULL,
     generate_time       TIMESTAMPTZ,
-    valid_time          TIMESTAMPTZ,
-    forecast_hour       INTEGER,
     x_easting           JSON,
     y_northing          JSON,
     cloud_cover_low     JSON,
@@ -102,25 +108,72 @@ CREATE TABLE IF NOT EXISTS laddms.weather_cloud_layers (
     cloud_cover_total   JSON,
     cloud_base_height   JSON,
     cloud_top_height    JSON,
+    cloud_base_height_m     REAL,
+    cloud_drift_speed       REAL,
+    cloud_drift_direction   REAL,
     center_lat          DOUBLE PRECISION,
     center_lon          DOUBLE PRECISION,
     range_miles         REAL,
     utm_zone_epsg       INTEGER
 );
 
-COMMENT ON TABLE  laddms.weather_cloud_layers IS 'HRRR layered cloud cover, clipped to a lat/lon radius. One row per forecast hour; grid columns follow the same (M, N) convention as laddms.weather_clouds.';
-COMMENT ON COLUMN laddms.weather_cloud_layers.generate_time IS 'HRRR run initialization time. Rows from one poll share it.';
-COMMENT ON COLUMN laddms.weather_cloud_layers.valid_time IS 'Time the row describes: generate_time + forecast_hour.';
-COMMENT ON COLUMN laddms.weather_cloud_layers.forecast_hour IS 'Hours past the run. 0 is the analysis (the model present); higher values are forecasts.';
+COMMENT ON TABLE  laddms.weather_cloud_layers IS 'HRRR layered cloud cover and steering wind, clipped to a lat/lon radius. Analysis only, no forecast. Grid columns follow the same (M, N) convention as laddms.weather_clouds.';
+COMMENT ON COLUMN laddms.weather_cloud_layers.generate_time IS 'HRRR run initialization time; the analysis this row describes.';
 COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_cover_low IS 'Units: percent. Low cloud layer fraction.';
 COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_cover_mid IS 'Units: percent. Middle cloud layer fraction.';
 COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_cover_high IS 'Units: percent. High cloud layer fraction.';
 COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_cover_total IS 'Units: percent. Whole-column cloud fraction; always >= each individual layer.';
 COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_base_height IS 'Units: geopotential metres, lowest cloud base in the column. NULL where there is no cloud (HRRR writes a 9999 sentinel, which the feed strips).';
 COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_top_height IS 'Units: geopotential metres, highest cloud top in the column. NULL where there is no cloud.';
+COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_base_height_m IS 'Scalar summary: median cloud base over cells that have one. Units: metres.';
+COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_drift_speed IS 'Scalar summary: area-mean 700 mb wind speed, the rate a cloud field advects across the box. Units: mph.';
+COMMENT ON COLUMN laddms.weather_cloud_layers.cloud_drift_direction IS 'Scalar summary: area-mean 700 mb wind bearing the wind blows FROM. Units: degrees.';
 
 SELECT create_hypertable(
     'laddms.weather_cloud_layers',
     'write_time',
     chunk_time_interval => INTERVAL '1 week'
 );
+
+
+
+-- ---------------------------------------------------------------------------
+-- Cloud and wind summary columns on the existing conditions table.
+--
+-- laddms.weather_conditions is already deployed and carrying data, so these go
+-- on with ALTER rather than a recreate. Only the current-conditions row fills
+-- them; forecast rows leave them NULL, exactly like feels_like and
+-- precip_last3hours already do.
+--
+-- The cloud values are handed over by the cloud feed threads, which poll on
+-- their own cadences, so they can lag the weather half of a row by up to one
+-- cloud poll. cloud_observed_time and cloud_layer_observed_time are how a
+-- consumer tells.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE laddms.weather_conditions
+    ADD COLUMN IF NOT EXISTS wind_speed                REAL,
+    ADD COLUMN IF NOT EXISTS wind_direction            REAL,
+    ADD COLUMN IF NOT EXISTS wind_gust                 REAL,
+    ADD COLUMN IF NOT EXISTS sky_coverage              REAL,
+    ADD COLUMN IF NOT EXISTS cloud_type                TEXT,
+    ADD COLUMN IF NOT EXISTS cloud_density             REAL,
+    ADD COLUMN IF NOT EXISTS cloud_base_height         REAL,
+    ADD COLUMN IF NOT EXISTS cloud_top_height          REAL,
+    ADD COLUMN IF NOT EXISTS cloud_drift_speed         REAL,
+    ADD COLUMN IF NOT EXISTS cloud_drift_direction     REAL,
+    ADD COLUMN IF NOT EXISTS cloud_observed_time       TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS cloud_layer_observed_time TIMESTAMPTZ;
+
+COMMENT ON COLUMN laddms.weather_conditions.wind_speed IS 'Units: mph. Surface wind from the NWS station observation (reported in km/h and converted).';
+COMMENT ON COLUMN laddms.weather_conditions.wind_direction IS 'Units: degrees, the bearing the wind blows FROM.';
+COMMENT ON COLUMN laddms.weather_conditions.wind_gust IS 'Units: mph. NULL when the station reports no gust.';
+COMMENT ON COLUMN laddms.weather_conditions.sky_coverage IS 'Units: percent of area under cloud, from the GOES cloud probability field.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_type IS 'DERIVED cloud genus (ISCCP-style, from cloud top height and optical depth) -- not an observed product. See laddms.weather_clouds.cloud_type.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_density IS 'Mean cloud optical depth over cloudy pixels. Dimensionless; higher is more opaque.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_base_height IS 'Units: metres. Median cloud base across the area, from HRRR.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_top_height IS 'Units: metres. Median cloud top across the area, from GOES.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_drift_speed IS 'Units: mph. Area-mean 700 mb wind -- the speed a cloud field actually advects, which surface wind understates.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_drift_direction IS 'Units: degrees, the bearing the 700 mb wind blows FROM.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_observed_time IS 'GOES scan time behind sky_coverage / cloud_type / cloud_density / cloud_top_height.';
+COMMENT ON COLUMN laddms.weather_conditions.cloud_layer_observed_time IS 'HRRR analysis time behind cloud_base_height and the drift columns.';

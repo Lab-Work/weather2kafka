@@ -7,7 +7,7 @@ Four feeds run on their own threads:
 | Forecast | `weather_forecast` / `laddms.weather_conditions` | NWS current conditions + hourly forecast | 30 min |
 | Radar | `weather_radar` / `laddms.weather_radar` | NOAA MRMS `BREF_QCD`, clipped to a radius | 5 min |
 | Clouds | `weather_clouds` / `laddms.weather_clouds` | GOES-19 ABI L2, 2 km, observed | 10 min |
-| Cloud layers | `weather_cloud_layers` / `laddms.weather_cloud_layers` | HRRR, 3 km, layered + forecast | 1 hour |
+| Cloud layers | `weather_cloud_layers` / `laddms.weather_cloud_layers` | HRRR, 3 km, layered analysis + steering wind | 1 hour |
 
 Logs are JSON on stdout and Prometheus metrics are served on `:9100/metrics`.
 SIGTERM/SIGINT stop every loop cleanly.
@@ -31,20 +31,82 @@ The four source products are published a couple of minutes apart, so the feed
 takes the newest scan timestamp present in **all** of them rather than each
 product's own newest — otherwise a row would mix fields from different instants.
 
-**`weather_cloud_layers` — vertical structure and the near future.** HRRR
-`wrfsfc`, 3 km, hourly. Each row is one forecast hour and carries
-`cloud_cover_low` / `_mid` / `_high` / `_total` (percent) plus
-`cloud_base_height` and `cloud_top_height`. Forecast hour 0 is the analysis —
-the model's estimate of the present — and the higher hours let a viewer animate
-clouds forward instead of only rendering the current instant. Set the hours with
-`WEATHER_CLOUD_LAYER_FORECAST_HOURS`; each one costs a ~10 MB ranged download
-per poll, so keep the list short.
+**`weather_cloud_layers` — vertical structure and cloud drift.** HRRR `wrfsfc`,
+3 km, hourly, **analysis only**. Each row carries `cloud_cover_low` / `_mid` /
+`_high` / `_total` (percent) plus `cloud_base_height` and `cloud_top_height`
+grids. This feed deliberately holds no forecast: cloud cover here is a visual
+layer, not something being predicted against, so there is nothing to animate
+forward and no reason to pay for the extra downloads.
+
+It also carries the **700 mb cloud-steering wind** as `cloud_drift_speed` and
+`cloud_drift_direction`. That is the wind that actually advects a cloud field
+across a map — surface wind is slowed and turned by friction and terrain, so it
+understates cloud motion badly. This is fetched as a second byte range rather
+than widening the first: the wind messages sit far from the cloud block in the
+file, and one span covering both costs ~34 MB against ~8.5 MB + ~1.2 MB.
+
+Poll cadence for both cloud feeds is `WEATHER_CLOUD_UPDATE_SECS` and
+`WEATHER_CLOUD_LAYER_UPDATE_SECS`. Neither has a code-side default.
 
 Both feeds emit the radar feed's payload shape — 2-D JSON arrays over a
 per-pixel UTM `x_easting` / `y_northing` grid, ordered from the upper left — so
 a consumer that already draws `weather_radar` can draw these with the same code.
 
 Both NOAA buckets are public: anonymous HTTPS, no AWS credentials to configure.
+
+## The summary row
+
+Each cloud poll also reduces its grid to scalars, and the forecast feed folds
+those into the **current-conditions row** it already writes, so one row in
+`laddms.weather_conditions` describes the whole sky:
+
+| Column | Units | Source |
+|---|---|---|
+| `sky_coverage` | percent of area | GOES mean cloud probability |
+| `cloud_type` | genus name | **derived**, see below |
+| `cloud_density` | optical depth | GOES, mean over cloudy pixels |
+| `cloud_top_height` | metres | GOES, median over cloudy pixels |
+| `cloud_base_height` | metres | HRRR, median over cells with a base |
+| `cloud_drift_speed` / `_direction` | mph / degrees FROM | HRRR 700 mb area mean |
+| `wind_speed` / `_direction` / `_gust` | mph / degrees FROM | NWS station observation |
+
+Wind comes free: the current-conditions observation the forecast feed already
+fetches carries `windSpeed`, `windDirection` and `windGust`, so there is no
+extra request. It is reported in km/h and converted, since the rest of the table
+is imperial. `windDirection` is legitimately null when the station reports a
+variable direction (METAR `VRB`), so the column is nullable by design.
+
+Only the current row fills these; forecast rows leave them NULL, exactly as
+`feels_like` and `precip_last3hours` already do.
+
+**Staleness.** The feeds are separate threads on separate cadences, so the cloud
+half of a summary row can lag the weather half by up to one cloud poll.
+`cloud_observed_time` and `cloud_layer_observed_time` carry the GOES scan time
+and HRRR analysis time so a consumer can tell. Right after a restart they are
+NULL until the first cloud poll lands, which is normal and not an error.
+
+### `cloud_type` is derived, not observed
+
+There is no NOAA cloud-type product. GOES publishes cloud *phase* (liquid/ice)
+but not genus, so `cloud_type` is computed here using the ISCCP scheme, which
+sorts cloud on two axes — how high the top is, and how optically thick it is:
+
+| | thin (τ<3.6) | medium (τ 3.6–23) | thick (τ>23) |
+|---|---|---|---|
+| **high** (top >6 km) | cirrus | cirrostratus | deep_convection |
+| **middle** (2–6 km) | altocumulus | altostratus | nimbostratus |
+| **low** (top <2 km) | cumulus | stratocumulus | stratus |
+
+Below 10% coverage it reports `clear` and no genus. ISCCP defines the height
+axis on cloud-top pressure; this uses height against the WMO mid-latitude etage
+boundaries instead, because the feed already carries height in metres.
+
+**Read it as a one-word summary of a 60-mile box, not as an observation of a
+cloud.** It is computed from *median* top height and *mean* optical depth, so a
+genuinely mixed sky — scattered cumulus under a high deck — collapses to a
+single label that may match neither layer. The grids in `weather_clouds` and
+`weather_cloud_layers` carry the real structure; this column is for when a
+caller wants one word.
 
 ### Notes for anyone modifying the cloud feeds
 
@@ -57,11 +119,21 @@ loudly if they are undone:
   as entirely NaN with no error. The feed switches auto-masking off and unpacks
   against `_FillValue` by hand. The `x`/`y` coordinate axes must still be read
   *before* auto-scaling is disabled — they are packed too.
-* **HRRR GRIB message numbers shift between forecast hours.** The cloud block
-  sits at messages 112-121 in `f00` but 115-124 in `f03`. The feed looks fields
-  up in the `.idx` by `(parameter, level)` and then selects bands by their GDAL
+* **HRRR GRIB message numbers are not stable.** The cloud block sits at
+  messages 112-121 in one file and 115-124 in another. The feed looks fields up
+  in the `.idx` by `(parameter, level)` and then selects bands by their GDAL
   `GRIB_ELEMENT` / `GRIB_SHORT_NAME` tags. Hardcoding message numbers reads the
-  wrong fields without erroring.
+  wrong fields without erroring. Note the short name for a pressure level is in
+  pascals, not millibars: 700 mb is `70000-ISBL`.
+* **The scalar summaries must not reuse a grid column's name.** `cloud_top_height`
+  and `cloud_base_height` are grids on the cloud rows, so the scalars go in as
+  `cloud_top_height_m` and `cloud_base_height_m` there. On
+  `weather_conditions`, where there are no grids, they keep the bare names.
+* **Every row of a bulk insert must carry identical keys.** `lv_db_connector`
+  takes its column set from the first row and raises on any later row that
+  lacks a key. The current-conditions row is richer than the forecast rows
+  behind it, and its cloud keys are absent entirely until a cloud poll lands, so
+  `insert_weather_batch()` pads every row against `WEATHER_SUMMARY_COLUMNS`.
 * **HRRR writes `9999` into cloud base/top height where there is no cloud** and
   sets no GRIB nodata value to declare it. The feed strips it to NULL. Left in,
   it renders as a 9999 m cloud deck over every clear pixel.

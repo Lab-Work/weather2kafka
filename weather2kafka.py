@@ -4,7 +4,11 @@ Four independent feeds run on their own threads with their own cadences:
     * weather_forecast     — api.weather.gov points/stations/hourly forecast
     * weather_radar        — MRMS BREF_QCD GeoTIFF, clipped to a lat/lon radius
     * weather_clouds       — GOES-19 ABI L2 observed cloud fields, 2 km
-    * weather_cloud_layers — HRRR low/middle/high cloud fraction, 3 km + forecast
+    * weather_cloud_layers — HRRR cloud layers and steering wind, 3 km, analysis
+
+The cloud feeds also reduce their grids to scalars (sky coverage, cloud type,
+density, base/top height, drift) which the forecast feed folds into the
+current-conditions row alongside wind, so one summary row describes the sky.
 
     Run:        python weather2kafka.py
     Logs:       JSON on stdout (Loki-friendly)
@@ -124,6 +128,33 @@ def _sleep_responsively(seconds: float) -> None:
 # Database connector — all weather SQL lives here.
 # =============================================================================
 
+# Columns on laddms.weather_conditions that only the current-conditions row
+# fills in: wind from the station observation, plus the cloud scalars handed
+# over by the cloud feed threads. Forecast rows leave every one of them NULL.
+#
+# The list is explicit and every row is padded against it before insert, for two
+# reasons that both bite silently otherwise. The bulk insert takes its column
+# set from the FIRST row and raises on any later row that lacks a key, so a
+# current row richer than the forecast rows behind it would fail the whole
+# batch. And the current row's own cloud keys are dynamic — absent entirely
+# until a cloud poll has completed, which is the normal state right after a
+# restart — so the column set would otherwise change shape between polls.
+WEATHER_SUMMARY_COLUMNS = (
+    'wind_speed',
+    'wind_direction',
+    'wind_gust',
+    'sky_coverage',
+    'cloud_type',
+    'cloud_density',
+    'cloud_base_height',
+    'cloud_top_height',
+    'cloud_drift_speed',
+    'cloud_drift_direction',
+    'cloud_observed_time',
+    'cloud_layer_observed_time',
+)
+
+
 class WeatherDb(Connector):
     """Postgres connector with one insert method per weather table."""
 
@@ -159,9 +190,12 @@ class WeatherForecastProducer:
         Insert the current observation and forecast periods into laddms.weather_conditions
         using a single write_time.
         """
-        self.db.insert_weather_conditions(
-            [{'write_time': write_time, **d} for d in [current_dict] + forecast_dicts]
-        )
+        rows = []
+        for row in [current_dict] + forecast_dicts:
+            padded = {column: None for column in WEATHER_SUMMARY_COLUMNS}
+            padded.update(row)
+            rows.append({'write_time': write_time, **padded})
+        self.db.insert_weather_conditions(rows)
         logger.info(f"Inserted {len(forecast_dicts) + 1} rows into laddms.weather_conditions.")
 
 
@@ -218,6 +252,18 @@ class WeatherForecastProducer:
         else:
             feels_like = None
 
+        # Wind comes free with the observation already fetched above. The NWS
+        # reports it in km/h; the rest of this table is imperial, so convert.
+        def observed_wind_mph(field):
+            value = obs.get(field, {}).get('value', None)
+            if value is None:
+                return None
+            if obs.get(field, {}).get('unitCode', '').upper() != 'WMOUNIT:KM_H-1':
+                return None
+            return float(value) * KM_PER_HOUR_TO_MPH
+
+        wind_direction = obs.get('windDirection', {}).get('value', None)
+
         # Output Current Conditions
         current_dict = {
             'start_time': obs['timestamp'],
@@ -230,7 +276,17 @@ class WeatherForecastProducer:
             'short_forecast': obs.get('textDescription', None),
             'precip_chance': None,
             'precip_last3hours': precip_last,
+            'wind_speed': observed_wind_mph('windSpeed'),
+            'wind_gust': observed_wind_mph('windGust'),
+            'wind_direction': float(wind_direction) if wind_direction is not None else None,
         }
+
+        # Fold in whatever the cloud feeds have most recently computed. They run
+        # on their own cadences, so these can be up to one cloud poll stale —
+        # cloud_observed_time and cloud_layer_observed_time say how stale. An
+        # empty dict here just means no cloud poll has completed yet, which is
+        # normal for the first forecast row after a restart.
+        current_dict.update(read_summary_values())
 
         # Current UTC time (aware, not naive)
         utc_now = datetime.now(tz=ZoneInfo("UTC"))
@@ -260,6 +316,10 @@ class WeatherForecastProducer:
             except (ValueError, KeyError, TypeError):
                 precip_chance = None
 
+            # The cloud and wind summary columns are deliberately absent here:
+            # they describe observed conditions now, and this row is a forecast
+            # period. Postgres leaves them NULL, which is how the existing
+            # current-only columns (feels_like, precip_last3hours) already work.
             forecast_dict = {
                 'start_time': period['startTime'],
                 'end_time': period['endTime'],
@@ -521,6 +581,15 @@ HRRR_CLOUD_FIELDS = [
     ("HGT", "cloud top", "0-CTL", "cloud_top_height"),
 ]
 
+# 700 mb is the conventional cloud-steering level: it sits inside the
+# cloud-bearing layer, so its wind is what actually advects a cloud field across
+# a map. Surface wind is a poor proxy for that — friction and terrain slow and
+# turn it — which is why the summary carries both, from different sources.
+HRRR_STEERING_FIELDS = [
+    ("UGRD", "700 mb", "70000-ISBL", "u"),
+    ("VGRD", "700 mb", "70000-ISBL", "v"),
+]
+
 # HRRR writes 9999 into the cloud base/top height fields where there is no
 # cloud, and sets no GRIB nodata value to say so. It is unambiguous: 9999.0
 # appears exactly, in 44-75% of cells, with a clean gap below it, while real
@@ -549,6 +618,150 @@ def grid_to_json_safe(array, decimals=2):
     """
     rounded = np.round(np.asarray(array, dtype='float64'), decimals)
     return np.where(np.isfinite(rounded), rounded, None).tolist()
+
+
+# Cloud-type classification.
+#
+# There is no NOAA "cloud type" product to read — GOES publishes cloud *phase*
+# (liquid/ice) but not genus — so the type reported below is DERIVED, not
+# observed. It follows the ISCCP scheme, which sorts cloud into nine classes on
+# two axes: how high the cloud top is, and how optically thick the cloud is.
+# ISCCP defines the height axis on cloud-top pressure; this uses cloud-top
+# height against the WMO mid-latitude etage boundaries instead, because the feed
+# already carries height in metres and a renderer thinks in metres. The
+# optical-depth breakpoints are ISCCP's own.
+CLOUD_ETAGE_BOUNDARIES_M = (2000.0, 6000.0)      # low | middle | high
+CLOUD_OPTICAL_DEPTH_BREAKS = (3.6, 23.0)         # thin | medium | thick
+CLOUD_TYPE_TABLE = {
+    'low': ('cumulus', 'stratocumulus', 'stratus'),
+    'middle': ('altocumulus', 'altostratus', 'nimbostratus'),
+    'high': ('cirrus', 'cirrostratus', 'deep_convection'),
+}
+# Below this areal coverage the scene is reported as clear with no type: naming
+# the genus of a few stray pixels is noise, not information.
+CLOUD_CLEAR_SKY_COVERAGE_PCT = 10.0
+
+METRES_PER_SECOND_TO_MPH = 2.23694
+KM_PER_HOUR_TO_MPH = 1 / 1.609344
+
+
+# =============================================================================
+# Summary handoff between the feed threads.
+#
+# The cloud feeds reduce their grids to a handful of scalars, and the forecast
+# feed folds those into the current-conditions row it already writes, so the
+# summary a consumer reads has clouds and wind in one place.
+#
+# The feeds are separate threads on separate cadences, so this dict is the
+# handoff: each cloud poll drops its scalars here and the next forecast poll
+# picks up whatever is present. The cloud half of a summary row can therefore
+# lag its weather half by up to one cloud poll, which is why the contributions
+# carry their own observation timestamps.
+# =============================================================================
+
+_summary_values: dict = {}
+_summary_lock = threading.Lock()
+
+
+def publish_summary_values(values: dict) -> None:
+    """Record scalars for the next current-conditions row."""
+    with _summary_lock:
+        _summary_values.update(values)
+
+
+def read_summary_values() -> dict:
+    """Snapshot of whatever the cloud feeds have contributed so far."""
+    with _summary_lock:
+        return dict(_summary_values)
+
+
+def nan_safe_float(value):
+    """Plain float, or None when the value is NaN/inf.
+
+    Every summary scalar goes through this: NaN is not valid JSON and is not a
+    valid REAL, and an all-clear or all-missing grid reduces to NaN naturally.
+    """
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def classify_cloud_type(cloud_top_height_m, cloud_optical_depth, sky_coverage_pct):
+    """Name the dominant cloud genus. See CLOUD_TYPE_TABLE for the scheme."""
+    if sky_coverage_pct is not None and sky_coverage_pct < CLOUD_CLEAR_SKY_COVERAGE_PCT:
+        return 'clear'
+    if cloud_top_height_m is None or cloud_optical_depth is None:
+        return None
+
+    low_boundary, high_boundary = CLOUD_ETAGE_BOUNDARIES_M
+    if cloud_top_height_m < low_boundary:
+        etage = 'low'
+    elif cloud_top_height_m < high_boundary:
+        etage = 'middle'
+    else:
+        etage = 'high'
+
+    thin_break, thick_break = CLOUD_OPTICAL_DEPTH_BREAKS
+    if cloud_optical_depth < thin_break:
+        thickness = 0
+    elif cloud_optical_depth < thick_break:
+        thickness = 1
+    else:
+        thickness = 2
+
+    return CLOUD_TYPE_TABLE[etage][thickness]
+
+
+def summarize_cloud_field(cloud_probability, cloud_top_height, cloud_optical_depth):
+    """Reduce a GOES cloud grid to the scalars the weather summary carries.
+
+    Sky coverage is the mean cloud probability, which is the expected fraction
+    of the box under cloud — a better areal estimate than counting pixels over a
+    threshold. Height and density are conditioned on the cloudy pixels only:
+    averaging cloud-top height across clear sky would drag it toward nothing.
+    """
+    cloudy = cloud_probability >= 0.5
+    sky_coverage = nan_safe_float(np.nanmean(cloud_probability) * 100.0)
+
+    cloudy_heights = cloud_top_height[cloudy & np.isfinite(cloud_top_height)]
+    cloudy_depths = cloud_optical_depth[cloudy & np.isfinite(cloud_optical_depth)]
+    top_height = nan_safe_float(np.median(cloudy_heights)) if cloudy_heights.size else None
+    density = nan_safe_float(np.mean(cloudy_depths)) if cloudy_depths.size else None
+
+    return {
+        'sky_coverage': sky_coverage,
+        'cloud_top_height': top_height,
+        'cloud_density': density,
+        'cloud_type': classify_cloud_type(top_height, density, sky_coverage),
+    }
+
+
+def mean_wind_speed_and_direction(u_component, v_component):
+    """Area-mean wind as (speed mph, meteorological direction degrees).
+
+    Direction is the compass bearing the wind blows FROM, matching the NWS
+    observation's convention. The mean is taken on the components before the
+    magnitude so opposing flow cancels, which is what "overall wind for the
+    area" should mean.
+    """
+    mean_u = float(np.mean(u_component))
+    mean_v = float(np.mean(v_component))
+    speed_mph = float(np.hypot(mean_u, mean_v)) * METRES_PER_SECOND_TO_MPH
+    direction = float((270.0 - np.degrees(np.arctan2(mean_v, mean_u))) % 360.0)
+    return nan_safe_float(speed_mph), nan_safe_float(direction)
+
+
+def clip_window_for(src, center_lat, center_lon, range_miles):
+    """Row/column bounds on `src` covering a radius around a center point."""
+    to_grid = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+    center_x, center_y = to_grid.transform(center_lon, center_lat)
+    buffer_m = 1609.34 * range_miles
+    row_top, col_left = rowcol(src.transform, center_x - buffer_m, center_y + buffer_m)
+    row_bottom, col_right = rowcol(src.transform, center_x + buffer_m, center_y - buffer_m)
+    row_top = max(0, min(int(row_top), src.height - 1))
+    row_bottom = max(0, min(int(row_bottom), src.height - 1))
+    col_left = max(0, min(int(col_left), src.width - 1))
+    col_right = max(0, min(int(col_right), src.width - 1))
+    return row_top, row_bottom, col_left, col_right
 
 
 class WeatherCloudProducer:
@@ -703,7 +916,7 @@ class WeatherCloudProducer:
 
         grid_x, grid_y, windows, geos_crs = geometry
         cloud_dicts = []
-        for (center_lat, center_lon, range_miles), fields in fields_by_location.items():
+        for index, ((center_lat, center_lon, range_miles), fields) in enumerate(fields_by_location.items()):
             y_indices, x_indices = windows[(center_lat, center_lon, range_miles)]
             window_x = grid_x[x_indices.min():x_indices.max() + 1]
             window_y = grid_y[y_indices.min():y_indices.max() + 1]
@@ -723,9 +936,29 @@ class WeatherCloudProducer:
                 'range_miles': range_miles,
                 'utm_zone_epsg': utm_epsg,
             }
+            # Scalars describing the whole clipped field. They ride along on
+            # this row so the cloud topic is self-describing, and they are also
+            # handed to the forecast feed for the current-conditions summary.
+            summary = summarize_cloud_field(
+                fields['cloud_probability'], fields['cloud_top_height'], fields['cloud_optical_depth'])
+
             for column, values in fields.items():
                 cloud_dict[column] = grid_to_json_safe(values)
+
+            # Suffixed deliberately: this row already has a cloud_top_height
+            # column holding the whole grid, and assigning the scalar under that
+            # name would replace the grid with a single number.
+            cloud_dict['cloud_top_height_m'] = summary['cloud_top_height']
+            cloud_dict['sky_coverage'] = summary['sky_coverage']
+            cloud_dict['cloud_type'] = summary['cloud_type']
+            cloud_dict['cloud_density'] = summary['cloud_density']
             cloud_dicts.append(cloud_dict)
+
+            if index == 0:
+                # The weather summary describes a single place. If more
+                # locations are ever configured, the first is the one it speaks
+                # for — the rest still get their own rows and topic messages.
+                publish_summary_values({**summary, 'cloud_observed_time': generate_time.isoformat()})
 
         return cloud_dicts
 
@@ -742,21 +975,21 @@ class WeatherCloudProducer:
 
 
 class WeatherCloudLayerProducer:
-    """HRRR low/middle/high cloud fraction and cloud base/top height.
+    """HRRR cloud layers, cloud base/top height and the cloud-steering wind.
 
-    One row per location per forecast hour. Forecast hour 0 is the analysis —
-    the model's best estimate of the present — and anything above it lets a
-    viewer animate cloud cover forward.
+    Analysis only — forecast hour 0, the model's estimate of the present. This
+    feed deliberately carries no forecast: cloud cover here is a visual layer,
+    not something anyone is predicting against, so there is nothing to animate
+    forward and no reason to pay for the extra downloads.
     """
 
-    def __init__(self, bucket_url, lat_lon_range_list, forecast_hours, poll_interval_seconds,
+    def __init__(self, bucket_url, lat_lon_range_list, poll_interval_seconds,
                  kafka: KafkaProducer, db: WeatherDb):
         self.bucket_url = bucket_url
         self.poll_interval_seconds = poll_interval_seconds
         self.kafka = kafka
         self.db = db
         self.location_list = lat_lon_range_list
-        self.forecast_hours = forecast_hours
 
         self.topic_name = "weather_cloud_layers"
         self.partition_key = "0"
@@ -780,66 +1013,82 @@ class WeatherCloudLayerProducer:
         _sleep_responsively(self.poll_interval_seconds)
 
 
-    def grib_url(self, run_time, forecast_hour):
+    def grib_url(self, run_time):
+        """URL of the analysis (f00) surface file for a run."""
         return (f"{self.bucket_url}/hrrr.{run_time:%Y%m%d}/conus/"
-                f"hrrr.t{run_time:%H}z.wrfsfcf{forecast_hour:02d}.grib2")
+                f"hrrr.t{run_time:%H}z.wrfsfcf00.grib2")
 
 
     def latest_run(self):
-        """Newest HRRR run whose furthest needed forecast hour has been published.
+        """Newest HRRR run whose analysis file has been published.
 
         A run's files land progressively over roughly an hour, so the newest run
         directory on the bucket is regularly incomplete. Probe backwards and
-        take the first run that has the last hour we intend to read.
+        take the first run that actually has its analysis.
         """
-        furthest_hour = max(self.forecast_hours)
         now = dt.datetime.now(tz=dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
         for hours_back in range(1, HRRR_RUN_SEARCH_HOURS + 1):
             run_time = now - dt.timedelta(hours=hours_back)
-            response = requests.head(f"{self.grib_url(run_time, furthest_hour)}.idx", timeout=30)
+            response = requests.head(f"{self.grib_url(run_time)}.idx", timeout=30)
             if response.status_code == 200:
                 return run_time
         raise RuntimeError(
-            f"No HRRR run with forecast hour {furthest_hour} found in the last {HRRR_RUN_SEARCH_HOURS} hours."
+            f"No HRRR analysis found in the last {HRRR_RUN_SEARCH_HOURS} hours."
         )
 
 
-    def pull_cloud_layers_for_hour(self, run_time, forecast_hour):
-        """Fetch and clip one HRRR forecast hour, returning a dict per location."""
-        grib_url = self.grib_url(run_time, forecast_hour)
+    def fetch_grib_block(self, grib_url, index_rows, wanted_pairs, description):
+        """Download one contiguous byte range covering every wanted GRIB message.
 
-        # The .idx sidecar lists every GRIB message with its byte offset, so the
-        # cloud fields can be pulled without downloading the ~130 MB file.
+        The .idx sidecar lists each message with its byte offset, so the fields
+        we want can be pulled without downloading the ~130 MB file. Messages
+        that happen to sit between the wanted ones come along and decode into
+        extra bands that simply are not selected by the caller.
+        """
+        message_starts = {int(row[0]): int(row[1]) for row in index_rows}
+        message_numbers = [int(row[0]) for row in index_rows if (row[3], row[4]) in wanted_pairs]
+        if len(message_numbers) < len(wanted_pairs):
+            raise RuntimeError(
+                f"HRRR index is missing {description} fields "
+                f"(found {len(message_numbers)} of {len(wanted_pairs)})."
+            )
+        first_byte = message_starts[min(message_numbers)]
+        last_message = max(message_numbers)
+        last_byte = message_starts[last_message + 1] - 1 if (last_message + 1) in message_starts else ''
+        response = requests.get(grib_url, headers={'Range': f'bytes={first_byte}-{last_byte}'}, timeout=180)
+        if response.status_code not in (200, 206):
+            raise RuntimeError(
+                f"Failed to download HRRR {description} block {grib_url}: HTTP {response.status_code}")
+        return response.content
+
+
+    def pull_weather_cloud_layers(self):
+        """Fetch and clip the HRRR analysis, returning a dict per location."""
+        run_time = self.latest_run()
+        grib_url = self.grib_url(run_time)
+        logger.info(f"Fetching HRRR cloud layers from run {run_time:%Y-%m-%d %H}z analysis.")
+
         index_response = requests.get(f"{grib_url}.idx", timeout=60)
         if index_response.status_code != 200:
             raise RuntimeError(f"Failed to fetch HRRR index {grib_url}.idx: HTTP {index_response.status_code}")
         index_rows = [line.split(':') for line in index_response.text.strip().split('\n')]
-        message_starts = {int(row[0]): int(row[1]) for row in index_rows}
 
-        wanted = {(parameter, level) for parameter, level, _, _ in HRRR_CLOUD_FIELDS}
-        message_numbers = [int(row[0]) for row in index_rows if (row[3], row[4]) in wanted]
-        if len(message_numbers) < len(wanted):
-            raise RuntimeError(
-                f"HRRR index for f{forecast_hour:02d} is missing cloud fields "
-                f"(found {len(message_numbers)} of {len(wanted)})."
-            )
+        # Two ranges, not one. The steering-wind messages sit far from the cloud
+        # block in the file, so a single span covering both costs ~34 MB against
+        # ~8.5 MB + ~1.2 MB for the two fetched separately.
+        cloud_block = self.fetch_grib_block(
+            grib_url, index_rows,
+            {(parameter, level) for parameter, level, _, _ in HRRR_CLOUD_FIELDS}, "cloud")
+        steering_block = self.fetch_grib_block(
+            grib_url, index_rows,
+            {(parameter, level) for parameter, level, _, _ in HRRR_STEERING_FIELDS}, "steering wind")
 
-        # One contiguous range over the whole cloud block instead of a request
-        # per field. The block has a few unrelated messages interleaved; they
-        # decode into extra bands that are simply not selected below.
-        first_byte = message_starts[min(message_numbers)]
-        last_message = max(message_numbers)
-        last_byte = message_starts[last_message + 1] - 1 if (last_message + 1) in message_starts else ''
-        block_response = requests.get(grib_url, headers={'Range': f'bytes={first_byte}-{last_byte}'}, timeout=180)
-        if block_response.status_code not in (200, 206):
-            raise RuntimeError(f"Failed to download HRRR block {grib_url}: HTTP {block_response.status_code}")
-
-        valid_time = run_time + dt.timedelta(hours=forecast_hour)
         layer_dicts = []
-        with MemoryFile(block_response.content) as memfile, memfile.open() as src:
-            # Select bands by their GRIB tags rather than by position: the block
-            # contains unrelated interleaved messages and its composition shifts
-            # between forecast hours.
+        with MemoryFile(cloud_block) as cloud_file, cloud_file.open() as src, \
+             MemoryFile(steering_block) as wind_file, wind_file.open() as wind_src:
+            # Select bands by their GRIB tags rather than by position: each block
+            # carries unrelated interleaved messages, and their composition is
+            # not guaranteed stable across HRRR versions.
             band_for_column = {}
             for band in range(1, src.count + 1):
                 tags = src.tags(band)
@@ -848,34 +1097,57 @@ class WeatherCloudLayerProducer:
                         band_for_column[column] = band
             missing = [column for _, _, _, column in HRRR_CLOUD_FIELDS if column not in band_for_column]
             if missing:
-                raise RuntimeError(f"HRRR block for f{forecast_hour:02d} is missing bands for: {missing}")
+                raise RuntimeError(f"HRRR cloud block is missing bands for: {missing}")
 
-            to_grid = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-            for center_lat, center_lon, range_miles in self.location_list:
-                center_x, center_y = to_grid.transform(center_lon, center_lat)
-                buffer_m = 1609.34 * range_miles
-                row_top, col_left = rowcol(src.transform, center_x - buffer_m, center_y + buffer_m)
-                row_bottom, col_right = rowcol(src.transform, center_x + buffer_m, center_y - buffer_m)
-                row_top = max(0, min(int(row_top), src.height - 1))
-                row_bottom = max(0, min(int(row_bottom), src.height - 1))
-                col_left = max(0, min(int(col_left), src.width - 1))
-                col_right = max(0, min(int(col_right), src.width - 1))
+            wind_band_for_column = {}
+            for band in range(1, wind_src.count + 1):
+                tags = wind_src.tags(band)
+                for parameter, _, short_name, column in HRRR_STEERING_FIELDS:
+                    if tags.get('GRIB_ELEMENT') == parameter and tags.get('GRIB_SHORT_NAME') == short_name:
+                        wind_band_for_column[column] = band
+            missing = [column for _, _, _, column in HRRR_STEERING_FIELDS if column not in wind_band_for_column]
+            if missing:
+                raise RuntimeError(f"HRRR steering wind block is missing bands for: {missing}")
+
+            for index, (center_lat, center_lon, range_miles) in enumerate(self.location_list):
+                row_top, row_bottom, col_left, col_right = clip_window_for(
+                    src, center_lat, center_lon, range_miles)
                 window = rasterio.windows.Window.from_slices(
                     (row_top, row_bottom + 1), (col_left, col_right + 1))
 
                 layer_dict = {
                     'generate_time': run_time.isoformat(),
-                    'valid_time': valid_time.isoformat(),
-                    'forecast_hour': forecast_hour,
                     'center_lat': center_lat,
                     'center_lon': center_lon,
                     'range_miles': range_miles,
                 }
+                grids = {}
                 for column, band in band_for_column.items():
                     values = src.read(band, window=window).astype('float64')
                     if column.endswith('_height'):
                         values = np.where(values == HRRR_NO_CLOUD_HEIGHT, np.nan, values)
+                    grids[column] = values
                     layer_dict[column] = grid_to_json_safe(values)
+
+                # The steering wind grid is the same projection and resolution,
+                # so the cloud window applies to it unchanged.
+                wind_window = rasterio.windows.Window.from_slices(
+                    (row_top, row_bottom + 1), (col_left, col_right + 1))
+                drift_speed, drift_direction = mean_wind_speed_and_direction(
+                    wind_src.read(wind_band_for_column['u'], window=wind_window),
+                    wind_src.read(wind_band_for_column['v'], window=wind_window))
+
+                base_heights = grids['cloud_base_height'][np.isfinite(grids['cloud_base_height'])]
+                summary = {
+                    'cloud_base_height': nan_safe_float(np.median(base_heights)) if base_heights.size else None,
+                    'cloud_drift_speed': drift_speed,
+                    'cloud_drift_direction': drift_direction,
+                }
+                # Suffixed for the same reason as the GOES row: cloud_base_height
+                # here is the grid, and the scalar must not take its name.
+                layer_dict['cloud_base_height_m'] = summary['cloud_base_height']
+                layer_dict['cloud_drift_speed'] = summary['cloud_drift_speed']
+                layer_dict['cloud_drift_direction'] = summary['cloud_drift_direction']
 
                 grid_rows, grid_cols = np.meshgrid(
                     np.arange(row_top, row_bottom + 1), np.arange(col_left, col_right + 1), indexing='ij')
@@ -891,16 +1163,9 @@ class WeatherCloudLayerProducer:
                 layer_dict['utm_zone_epsg'] = utm_epsg
                 layer_dicts.append(layer_dict)
 
-        return layer_dicts
+                if index == 0:
+                    publish_summary_values({**summary, 'cloud_layer_observed_time': run_time.isoformat()})
 
-
-    def pull_weather_cloud_layers(self):
-        run_time = self.latest_run()
-        logger.info(f"Fetching HRRR cloud layers from run {run_time:%Y-%m-%d %H}z, "
-                    f"forecast hours {self.forecast_hours}.")
-        layer_dicts = []
-        for forecast_hour in self.forecast_hours:
-            layer_dicts.extend(self.pull_cloud_layers_for_hour(run_time, forecast_hour))
         return layer_dicts
 
 
@@ -1007,9 +1272,9 @@ def update_weather_clouds(url, lat_lon_range_location_list, poll_interval,
         cloud_receiver.wait()
 
 
-def update_weather_cloud_layers(url, lat_lon_range_location_list, forecast_hours, poll_interval,
+def update_weather_cloud_layers(url, lat_lon_range_location_list, poll_interval,
                                 kafka: KafkaProducer, db: WeatherDb):
-    layer_receiver = WeatherCloudLayerProducer(url, lat_lon_range_location_list, forecast_hours,
+    layer_receiver = WeatherCloudLayerProducer(url, lat_lon_range_location_list,
                                                poll_interval, kafka=kafka, db=db)
     logger.info("Created new instance of weather cloud layer receiver.")
     while not _shutdown:
@@ -1075,11 +1340,6 @@ def main() -> None:
                 float(os.environ.get('WEATHER_CLOUD_RANGE_MI'))
             ),
         ]
-        # "0,1,2,3" -> [0, 1, 2, 3]. Hour 0 is the HRRR analysis (the model's
-        # present); the rest are the forecast hours a viewer animates through.
-        cloud_layer_forecast_hours = [
-            int(hour) for hour in os.environ.get('WEATHER_CLOUD_LAYER_FORECAST_HOURS').split(',')
-        ]
         threads = [
             threading.Thread(target=thread_wrapper(update_weather_forecast, args=(
                 os.environ.get('WEATHER_FORECAST_URL'),
@@ -1104,7 +1364,6 @@ def main() -> None:
             threading.Thread(target=thread_wrapper(update_weather_cloud_layers, args=(
                 os.environ.get('WEATHER_CLOUD_LAYER_URL'),
                 cloud_location_tuples,
-                cloud_layer_forecast_hours,
                 int(os.environ.get('WEATHER_CLOUD_LAYER_UPDATE_SECS')),
                 kafka,
                 db), name="weather_cloud_layers"), name="weather_cloud_layers"),
