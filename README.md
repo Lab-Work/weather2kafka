@@ -4,13 +4,20 @@ Four feeds run on their own threads:
 
 | Feed | Topic / table | Source | Cadence |
 |---|---|---|---|
-| Forecast | `weather_forecast` / `laddms.weather_conditions` | NWS current conditions + hourly forecast | 30 min |
-| Radar | `weather_radar` / `laddms.weather_radar` | NOAA MRMS `BREF_QCD`, clipped to a radius | 5 min |
-| Clouds | `weather_clouds` / `laddms.weather_clouds` | GOES-19 ABI L2, 2 km, observed | 10 min |
-| Cloud layers | `weather_cloud_layers` / `laddms.weather_cloud_layers` | HRRR, 3 km, layered analysis + steering wind | 1 hour |
+| Forecast | `weather_forecast` / `geo_feeds.weather_conditions` | NWS current conditions + hourly forecast | 30 min |
+| Radar | `weather_radar` / `geo_feeds.weather_radar` | NOAA MRMS `BREF_QCD`, clipped to a radius | 5 min |
+| Clouds | `weather_clouds` / `geo_feeds.weather_clouds` | GOES-19 ABI L2, 2 km, observed | 10 min |
+| Cloud layers | `weather_cloud_layers` / `geo_feeds.weather_cloud_layers` | HRRR, 3 km, layered analysis + steering wind | 1 hour |
 
 Logs are JSON on stdout and Prometheus metrics are served on `:9100/metrics`.
 SIGTERM/SIGINT stop every loop cleanly.
+
+All four tables live in the **`geo_feeds`** schema, alongside the rest of the
+2kafka fleet. They were created in `laddms` originally and moved on 2026-09-27
+— `weather_schema_move.sql` is that one-time migration, and it is safe to
+re-run. Anything still querying `laddms.weather_*` needs repointing; the
+migration file has commented-out compatibility views if you want a grace
+period instead.
 
 ## The cloud feeds
 
@@ -58,7 +65,7 @@ Both NOAA buckets are public: anonymous HTTPS, no AWS credentials to configure.
 
 Each cloud poll also reduces its grid to scalars, and the forecast feed folds
 those into the **current-conditions row** it already writes, so one row in
-`laddms.weather_conditions` describes the whole sky:
+`geo_feeds.weather_conditions` describes the whole sky:
 
 | Column | Units | Source |
 |---|---|---|

@@ -128,7 +128,7 @@ def _sleep_responsively(seconds: float) -> None:
 # Database connector — all weather SQL lives here.
 # =============================================================================
 
-# Columns on laddms.weather_conditions that only the current-conditions row
+# Columns on geo_feeds.weather_conditions that only the current-conditions row
 # fills in: wind from the station observation, plus the cloud scalars handed
 # over by the cloud feed threads. Forecast rows leave every one of them NULL.
 #
@@ -159,16 +159,16 @@ class WeatherDb(Connector):
     """Postgres connector with one insert method per weather table."""
 
     def insert_weather_conditions(self, rows: list[dict]) -> None:
-        self.insert("laddms.weather_conditions", rows)
+        self.insert("geo_feeds.weather_conditions", rows)
 
     def insert_weather_radar(self, rows: list[dict]) -> None:
-        self.insert("laddms.weather_radar", rows)
+        self.insert("geo_feeds.weather_radar", rows)
 
     def insert_weather_clouds(self, rows: list[dict]) -> None:
-        self.insert("laddms.weather_clouds", rows)
+        self.insert("geo_feeds.weather_clouds", rows)
 
     def insert_weather_cloud_layers(self, rows: list[dict]) -> None:
-        self.insert("laddms.weather_cloud_layers", rows)
+        self.insert("geo_feeds.weather_cloud_layers", rows)
 
 
 class WeatherForecastProducer:
@@ -187,7 +187,7 @@ class WeatherForecastProducer:
 
     def insert_weather_batch(self, current_dict: dict, forecast_dicts: list[dict], write_time: dt.datetime):
         """
-        Insert the current observation and forecast periods into laddms.weather_conditions
+        Insert the current observation and forecast periods into geo_feeds.weather_conditions
         using a single write_time.
         """
         rows = []
@@ -196,7 +196,7 @@ class WeatherForecastProducer:
             padded.update(row)
             rows.append({'write_time': write_time, **padded})
         self.db.insert_weather_conditions(rows)
-        logger.info(f"Inserted {len(forecast_dicts) + 1} rows into laddms.weather_conditions.")
+        logger.info(f"Inserted {len(forecast_dicts) + 1} rows into geo_feeds.weather_conditions.")
 
 
     def wait(self):
@@ -378,7 +378,7 @@ class WeatherRadarProducer:
 
     def insert_weather_radar(self, radar_dicts: list[dict]):
         """
-        Insert the clipped radar payloads into laddms.weather_radar using a single write_time.
+        Insert the clipped radar payloads into geo_feeds.weather_radar using a single write_time.
         """
         write_time = now_dtz()
         for radar_dict in radar_dicts:
@@ -386,7 +386,7 @@ class WeatherRadarProducer:
             radar_dict['y_northing'] = json.dumps(radar_dict['y_northing'])
             radar_dict['radar_array'] = json.dumps(radar_dict['radar_array'])
         self.db.insert_weather_radar([{'write_time': write_time, **d} for d in radar_dicts])
-        logger.info(f"Inserted {len(radar_dicts)} rows into laddms.weather_radar.")
+        logger.info(f"Inserted {len(radar_dicts)} rows into geo_feeds.weather_radar.")
 
 
     def wait(self):
@@ -783,7 +783,7 @@ class WeatherCloudProducer:
 
 
     def insert_weather_clouds(self, cloud_dicts: list[dict]):
-        """Insert the clipped cloud payloads into laddms.weather_clouds."""
+        """Insert the clipped cloud payloads into geo_feeds.weather_clouds."""
         write_time = now_dtz()
         rows = []
         for cloud_dict in cloud_dicts:
@@ -793,7 +793,7 @@ class WeatherCloudProducer:
                     row[column] = json.dumps(value)
             rows.append({'write_time': write_time, **row})
         self.db.insert_weather_clouds(rows)
-        logger.info(f"Inserted {len(rows)} rows into laddms.weather_clouds.")
+        logger.info(f"Inserted {len(rows)} rows into geo_feeds.weather_clouds.")
 
 
     def wait(self):
@@ -996,7 +996,7 @@ class WeatherCloudLayerProducer:
 
 
     def insert_weather_cloud_layers(self, layer_dicts: list[dict]):
-        """Insert the clipped cloud-layer payloads into laddms.weather_cloud_layers."""
+        """Insert the clipped cloud-layer payloads into geo_feeds.weather_cloud_layers."""
         write_time = now_dtz()
         rows = []
         for layer_dict in layer_dicts:
@@ -1006,7 +1006,7 @@ class WeatherCloudLayerProducer:
                     row[column] = json.dumps(value)
             rows.append({'write_time': write_time, **row})
         self.db.insert_weather_cloud_layers(rows)
-        logger.info(f"Inserted {len(rows)} rows into laddms.weather_cloud_layers.")
+        logger.info(f"Inserted {len(rows)} rows into geo_feeds.weather_cloud_layers.")
 
 
     def wait(self):
