@@ -13,11 +13,20 @@ Logs are JSON on stdout and Prometheus metrics are served on `:9100/metrics`.
 SIGTERM/SIGINT stop every loop cleanly.
 
 All four tables live in the **`geo_feeds`** schema, alongside the rest of the
-2kafka fleet. They were created in `laddms` originally and moved on 2026-09-27
-— `weather_schema_move.sql` is that one-time migration, and it is safe to
-re-run. Anything still querying `laddms.weather_*` needs repointing; the
-migration file has commented-out compatibility views if you want a grace
-period instead.
+2kafka fleet. `weather_tables.sql` is the complete setup for a clean database —
+tables, column documentation and hypertable conversion — and every statement in
+it is idempotent, so re-running it against a database that is already set up
+changes nothing and is the supported way to check:
+
+```
+psql -h $DB_HOST -U $DB_USER -d $DB_DBNAME -f weather_tables.sql
+```
+
+These tables were originally created in `laddms` and moved across on
+2026-09-27. `weather_schema_move.sql` is that one-time migration, kept for the
+record; a clean install does not need it. Anything still querying
+`laddms.weather_*` needs repointing, and that file has commented-out
+compatibility views if you want a grace period instead.
 
 ## The cloud feeds
 
