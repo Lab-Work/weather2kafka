@@ -109,6 +109,23 @@ def _on_signal(_signum, _frame) -> None:
     _shutdown = True
 
 
+def _connector_versions() -> dict[str, str]:
+    """Version of every lv_* connector this process has imported, for the `connectors`
+    startup log line.
+
+    The connectors are not version-pinned: an image gets whatever each connector repo's
+    default branch held when it was built, so this line is the only way to tell, from a
+    running service, which connector code it actually has. It reads each module's own
+    `__version__` (what is running), not pip's metadata, which an editable install
+    freezes at install time. A version is not a commit: two builds can share one.
+    """
+    return {
+        name: str(getattr(module, "__version__", "unknown"))
+        for name, module in sorted(sys.modules.items())
+        if name.startswith("lv_") and "." not in name
+    }
+
+
 def _sleep_responsively(seconds: float) -> None:
     """Sleep in small chunks so SIGTERM is responsive.
 
@@ -1315,7 +1332,15 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    logger.info("Starting 4x weather to Kafka producer threads.")
+    logger.info("connectors", extra={"connectors": _connector_versions()})
+    logger.info(
+        "startup",
+        extra={
+            "service": SERVICE,
+            # The four producer threads started below (their `name=`s).
+            "feeds": ["weather_forecast", "weather_radar", "weather_clouds", "weather_cloud_layers"],
+        },
+    )
 
     # One producer and one connector shared by both feed threads (the confluent
     # producer and the connection pool are both thread-safe).
